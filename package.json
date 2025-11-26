@@ -7,8 +7,5 @@
   "scripts": {
     "start": "node index.mjs",
     "test": "node --test"
-  },
-  "dependencies": {
-    "dotenv": "^17.2.3"
   }
 }

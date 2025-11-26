@@ -16,28 +16,23 @@ Scan a GitHub organization for dependencies compromised in the
 ## Requirements
 
 - Node.js **>= 18** (uses native `fetch`)
-- GitHub token with **read** access on the org’s repositories
-  - Provided via **`.env`** (`GITHUB_TOKEN=...`) or `--token` CLI option
+- GitHub token with **read** access on the org’s repositories, provided via the
+  `GITHUB_TOKEN` environment variable or `--token` CLI option.
 
 ## Install
 
-```bash
-yarn install
-```
+No installation step is required. Just run with Node.js **>= 18**.
 
 ## Usage
 
 Main entrypoint: **`index.mjs`**, exposed as `yarn start`.
 
 ```bash
-# with GITHUB_TOKEN in .env
-yarn start -- <org>
-
-# or explicitly
-gitHub_TOKEN=xxxx yarn start -- <org>
+# with GITHUB_TOKEN from the environment
+GITHUB_TOKEN=xxxx yarn start -- <org>
 
 # pure node
-gitHub_TOKEN=xxxx node index.mjs <org>
+GITHUB_TOKEN=xxxx node index.mjs <org>
 ```
 
 Examples:
@@ -60,7 +55,7 @@ node index.mjs <org> [--token TOKEN] [--no-version-check] [--packages-url URL] [
 ```
 
 - `<org>` (required): GitHub organization name
-- `--token TOKEN`: GitHub token (if not using `GITHUB_TOKEN` in `.env`)
+- `--token TOKEN`: GitHub token (if not using `GITHUB_TOKEN` env var)
 - `--no-version-check`: match by package **name only** (more noisy, safer)
 - `--packages-url URL`: override Tenable `list.md` URL
 - `--discovery MODE`:

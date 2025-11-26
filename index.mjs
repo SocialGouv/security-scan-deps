@@ -10,10 +10,7 @@
  *     (GITHUB_TOKEN env var or --token).
  */
 
-import dotenv from "dotenv";
 import { pathToFileURL } from "node:url";
-
-dotenv.config();
 
 const GITHUB_API_URL = "https://api.github.com";
 
