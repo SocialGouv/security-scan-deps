@@ -11,6 +11,7 @@
  */
 
 import dotenv from "dotenv";
+import { pathToFileURL } from "node:url";
 
 dotenv.config();
 
@@ -555,7 +556,7 @@ async function fetchFileContent(repoFullName, path, headers) {
 /**
  * Analyse a package-lock.json and return a list of compromised { name, version }.
  */
-function checkPackageLock(content, isCompromised) {
+export function checkPackageLock(content, isCompromised) {
   let data;
   try {
     data = JSON.parse(content);
@@ -613,7 +614,7 @@ function checkPackageLock(content, isCompromised) {
  *  - Extract package names from each specifier (before the last '@')
  *  - Read the "version" line within the block
  */
-function checkYarnLock(content, isCompromised) {
+export function checkYarnLock(content, isCompromised) {
   const lines = content.split(/\r?\n/);
   let currentPkgs = [];
   let currentVersion = null;
@@ -684,7 +685,7 @@ function checkYarnLock(content, isCompromised) {
  *   "/foo@1.2.3":
  *   "@scope/bar@4.5.6":
  */
-function checkPnpmLock(content, isCompromised) {
+export function checkPnpmLock(content, isCompromised) {
   const lines = content.split(/\r?\n/);
   const matchesMap = new Map();
   let inPackages = false;
@@ -743,7 +744,7 @@ function checkPnpmLock(content, isCompromised) {
 /**
  * Main program.
  */
-(async () => {
+async function main() {
   const { org, token, noVersionCheck, packagesUrl, discoveryMode } = parseArgs();
   const headers = buildGithubHeaders(token);
 
@@ -887,4 +888,10 @@ function checkPnpmLock(content, isCompromised) {
     }
     console.log("");
   }
-})();
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // Only run the CLI when this file is the main entrypoint
+  // (not when imported from tests or other modules).
+  main();
+}
