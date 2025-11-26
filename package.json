@@ -1,0 +1,13 @@
+{
+  "name": "security-scan-deps",
+  "version": "0.0.1",
+  "main": "index.mjs",
+  "license": "MIT",
+  "packageManager": "yarn@4.12.0",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3"
+  }
+}
