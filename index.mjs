@@ -16,6 +16,12 @@ import path from "node:path";
 
 const GITHUB_API_URL = "https://api.github.com";
 
+// Default per-request delay for GitHub API calls (in ms)
+const DEFAULT_GITHUB_DELAY_MS = 0;
+
+// Maximum wait time when rate-limited, in milliseconds (safety cap)
+const MAX_RATE_LIMIT_WAIT_MS = 2 * 60 * 1000; // 2 minutes
+
 // Default URL to DataDog's consolidated CSV of compromised packages
 const DEFAULT_PACKAGE_LIST_URL =
   "https://raw.githubusercontent.com/DataDog/indicators-of-compromise/refs/heads/main/shai-hulud-2.0/consolidated_iocs.csv";
@@ -40,7 +46,7 @@ function parseArgs() {
   const argv = process.argv.slice(2);
 
   const usage =
-    "Usage: node index.mjs <org> [--repo REPO] [--token TOKEN] [--no-version-check] [--packages-url URL] [--packages-file PATH] [--discovery MODE]\n" +
+    "Usage: node index.mjs <org> [--repo REPO] [--token TOKEN] [--no-version-check] [--packages-url URL] [--packages-file PATH] [--discovery MODE] [--github-delay-ms MS]\n" +
     "   or: node index.mjs --local [--no-version-check] [--packages-url URL] [--packages-file PATH]";
 
   if (argv.length === 0) {
@@ -56,6 +62,10 @@ function parseArgs() {
   let packagesUrl = DEFAULT_PACKAGE_LIST_URL;
   let packagesFile = null;
   let discoveryMode = "trees"; // "trees" (default) or "search"
+  let githubDelayMs = Number.parseInt(process.env.GITHUB_DELAY_MS || "", 10);
+  if (!Number.isFinite(githubDelayMs) || githubDelayMs < 0) {
+    githubDelayMs = DEFAULT_GITHUB_DELAY_MS;
+  }
 
   let i = 0;
   if (argv[0] === "--local") {
@@ -84,6 +94,11 @@ function parseArgs() {
       repo = argv[++i];
     } else if (mode === "remote" && arg === "--discovery" && argv[i + 1]) {
       discoveryMode = argv[++i];
+    } else if (arg === "--github-delay-ms" && argv[i + 1]) {
+      const val = Number.parseInt(argv[++i], 10);
+      if (Number.isFinite(val) && val >= 0) {
+        githubDelayMs = val;
+      }
     }
   }
 
@@ -103,6 +118,7 @@ function parseArgs() {
     packagesUrl,
     packagesFile,
     discoveryMode,
+    githubDelayMs,
   };
 }
 
@@ -114,6 +130,94 @@ function buildGithubHeaders(token) {
     "User-Agent": "shai-hulud-org-scanner",
     Accept: "application/vnd.github+json",
     Authorization: `Bearer ${token}`,
+  };
+}
+
+function sleep(ms) {
+  if (!ms || ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Create a small GitHub client wrapper that handles rate limiting and per-request delay.
+ */
+function makeGithubClient({ headers, delayMs = DEFAULT_GITHUB_DELAY_MS, maxRetries = 3 } = {}) {
+  const baseHeaders = headers || {};
+
+  const githubFetch = async (url, options = {}) => {
+    const { method = "GET", body, headers: extraHeaders } = options;
+    const finalHeaders = { ...baseHeaders, ...extraHeaders };
+
+    let attempt = 0;
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (delayMs && delayMs > 0) {
+        await sleep(delayMs);
+      }
+
+      const res = await fetch(url, {
+        method,
+        headers: finalHeaders,
+        body,
+      });
+
+      if (res.status !== 403) {
+        return res;
+      }
+
+      const lowerBody = (await res.clone().text()).toLowerCase();
+      const remaining = Number.parseInt(
+        res.headers.get("x-ratelimit-remaining") || "",
+        10
+      );
+
+      if (
+        (Number.isFinite(remaining) && remaining === 0) ||
+        lowerBody.includes("rate limit")
+      ) {
+        const reset = Number.parseInt(
+          res.headers.get("x-ratelimit-reset") || "",
+          10
+        );
+        let waitMs = Number.isFinite(reset)
+          ? reset * 1000 - Date.now()
+          : 0;
+        if (!Number.isFinite(waitMs) || waitMs < 0) {
+          waitMs = 0;
+        }
+        if (waitMs > MAX_RATE_LIMIT_WAIT_MS) {
+          waitMs = MAX_RATE_LIMIT_WAIT_MS;
+        }
+        if (waitMs < 1000) {
+          waitMs = 1000;
+        }
+
+        attempt += 1;
+        if (attempt > maxRetries) {
+          console.error(
+            `GitHub rate limit reached, giving up after ${maxRetries} retries. Last wait would have been ${waitMs}ms.\n` +
+              `  URL: ${url}`
+          );
+          return res;
+        }
+
+        console.error(
+          `GitHub rate limit reached (attempt ${attempt}/${maxRetries}). Waiting ${Math.round(
+            waitMs / 1000
+          )}s before retrying...`
+        );
+        await sleep(waitMs);
+        continue;
+      }
+
+      // Non rate-limit 403: just return and let callers handle
+      return res;
+    }
+  };
+
+  return {
+    fetch: githubFetch,
   };
 }
 
@@ -448,7 +552,8 @@ function buildMatcher(compromisedMap, noVersionCheck) {
  * Search all files with a given filename in an org using /search/code.
  * Limited to 1000 results by GitHub.
  */
-async function searchLockFiles(org, filename, headers) {
+async function searchLockFiles(org, filename, githubClient) {
+  const { fetch: githubFetch } = githubClient;
   const perPage = 100;
   let page = 1;
   let allItems = [];
@@ -463,7 +568,7 @@ async function searchLockFiles(org, filename, headers) {
 
     const url = `${GITHUB_API_URL}/search/code?${params.toString()}`;
     console.error(`GitHub search: ${filename} (page ${page})...`);
-    const res = await fetch(url, { headers });
+    const res = await githubFetch(url);
 
     if (res.status === 403) {
       const body = await res.text();
@@ -498,7 +603,8 @@ async function searchLockFiles(org, filename, headers) {
 /**
  * Search lockfiles in a specific repo via /search/code.
  */
-async function searchRepoLockFiles(repoFullName, filename, headers) {
+async function searchRepoLockFiles(repoFullName, filename, githubClient) {
+  const { fetch: githubFetch } = githubClient;
   const perPage = 100;
   let page = 1;
   let allItems = [];
@@ -515,7 +621,7 @@ async function searchRepoLockFiles(repoFullName, filename, headers) {
     console.error(
       `GitHub search (fallback): ${filename} in ${repoFullName} (page ${page})...`
     );
-    const res = await fetch(url, { headers });
+    const res = await githubFetch(url);
 
     if (res.status === 403) {
       const body = await res.text();
@@ -554,7 +660,7 @@ async function searchRepoLockFiles(repoFullName, filename, headers) {
  */
 async function fallbackSearchLockFilesForRepo(
   repoFullName,
-  headers,
+  githubClient,
   yarnArray,
   npmArray,
   pnpmArray
@@ -562,16 +668,20 @@ async function fallbackSearchLockFilesForRepo(
   try {
     console.error(`  -> Fallback /search/code for ${repoFullName}...`);
 
-    const yarnItems = await searchRepoLockFiles(repoFullName, "yarn.lock", headers);
+    const yarnItems = await searchRepoLockFiles(
+      repoFullName,
+      "yarn.lock",
+      githubClient
+    );
     const npmItems = await searchRepoLockFiles(
       repoFullName,
       "package-lock.json",
-      headers
+      githubClient
     );
     const pnpmItems = await searchRepoLockFiles(
       repoFullName,
       "pnpm-lock.yaml",
-      headers
+      githubClient
     );
 
     for (const item of yarnItems) {
@@ -593,7 +703,8 @@ async function fallbackSearchLockFilesForRepo(
 /**
  * List all repos in an org via /orgs/:org/repos.
  */
-async function listOrgRepos(org, headers) {
+async function listOrgRepos(org, githubClient) {
+  const { fetch: githubFetch } = githubClient;
   const perPage = 100;
   let page = 1;
   const repos = [];
@@ -608,7 +719,7 @@ async function listOrgRepos(org, headers) {
     });
 
     const url = `${GITHUB_API_URL}/orgs/${org}/repos?${params.toString()}`;
-    const res = await fetch(url, { headers });
+    const res = await githubFetch(url);
 
     if (res.status === 403) {
       const body = await res.text();
@@ -655,9 +766,11 @@ async function listOrgRepos(org, headers) {
  */
 async function listLockFilesViaTreesForRepos(
   repos,
-  headers,
+  githubClient,
   { includeArchived = false } = {}
 ) {
+  const { fetch: githubFetch } = githubClient;
+
   console.error(
     `Discovering lockfiles via Git trees across ${repos.length} repos...`
   );
@@ -687,7 +800,7 @@ async function listLockFilesViaTreesForRepos(
       const refUrl = `${GITHUB_API_URL}/repos/${repoFullName}/git/refs/heads/${encodeURIComponent(
         defaultBranch
       )}`;
-      const refRes = await fetch(refUrl, { headers });
+      const refRes = await githubFetch(refUrl);
 
       if (!refRes.ok) {
         const body = await refRes.text();
@@ -704,7 +817,7 @@ async function listLockFilesViaTreesForRepos(
           );
           await fallbackSearchLockFilesForRepo(
             repoFullName,
-            headers,
+            githubClient,
             yarn,
             npm,
             pnpm
@@ -724,20 +837,20 @@ async function listLockFilesViaTreesForRepos(
 
       // 2) Walk the Git tree recursively
       const treeUrl = `${GITHUB_API_URL}/repos/${repoFullName}/git/trees/${sha}?recursive=1`;
-      const treeRes = await fetch(treeUrl, { headers });
+      const treeRes = await githubFetch(treeUrl);
 
       if (!treeRes.ok) {
         const body = await treeRes.text();
         console.error(
           `Error calling /git/trees for ${repoFullName}@${defaultBranch}: ${treeRes.status} ${treeRes.statusText}: ${body}`
         );
-        await fallbackSearchLockFilesForRepo(
-          repoFullName,
-          headers,
-          yarn,
-          npm,
-          pnpm
-        );
+          await fallbackSearchLockFilesForRepo(
+            repoFullName,
+            githubClient,
+            yarn,
+            npm,
+            pnpm
+          );
         continue;
       }
 
@@ -758,7 +871,7 @@ async function listLockFilesViaTreesForRepos(
       );
       await fallbackSearchLockFilesForRepo(
         repoFullName,
-        headers,
+        githubClient,
         yarn,
         npm,
         pnpm
@@ -770,17 +883,18 @@ async function listLockFilesViaTreesForRepos(
   return { yarn, npm, pnpm };
 }
 
-async function listLockFilesViaTrees(org, headers) {
-  const repos = await listOrgRepos(org, headers);
-  return listLockFilesViaTreesForRepos(repos, headers, { includeArchived: false });
+async function listLockFilesViaTrees(org, githubClient) {
+  const repos = await listOrgRepos(org, githubClient);
+  return listLockFilesViaTreesForRepos(repos, githubClient, { includeArchived: false });
 }
 
-async function listLockFilesViaTreesForRepoFullName(repoFullName, headers) {
+async function listLockFilesViaTreesForRepoFullName(repoFullName, githubClient) {
+  const { fetch: githubFetch } = githubClient;
   console.error(
     `Listing single repo "${repoFullName}" via /repos/:owner/:repo...`
   );
   const url = `${GITHUB_API_URL}/repos/${repoFullName}`;
-  const res = await fetch(url, { headers });
+  const res = await githubFetch(url);
 
   if (!res.ok) {
     const body = await res.text();
@@ -790,20 +904,21 @@ async function listLockFilesViaTreesForRepoFullName(repoFullName, headers) {
   }
 
   const repo = await res.json();
-  return listLockFilesViaTreesForRepos([repo], headers, { includeArchived: true });
+  return listLockFilesViaTreesForRepos([repo], githubClient, { includeArchived: true });
 }
 
 /**
  * Download file content via /repos/:owner/:repo/contents/:path
  */
-async function fetchFileContent(repoFullName, path, headers) {
+async function fetchFileContent(repoFullName, path, githubClient) {
+  const { fetch: githubFetch } = githubClient;
   const encodedPath = path
     .split("/")
     .map((segment) => encodeURIComponent(segment))
     .join("/");
 
   const url = `${GITHUB_API_URL}/repos/${repoFullName}/contents/${encodedPath}`;
-  const res = await fetch(url, { headers });
+  const res = await githubFetch(url);
 
   if (res.status === 404) {
     return null;
@@ -1100,6 +1215,7 @@ async function main() {
     packagesUrl,
     packagesFile,
     discoveryMode,
+    githubDelayMs,
   } = parseArgs();
 
   // 1) Load compromised package list
@@ -1116,6 +1232,7 @@ async function main() {
     findings = await scanLocalDirectory(rootDir, isCompromised);
   } else {
     const headers = buildGithubHeaders(token);
+    const githubClient = makeGithubClient({ headers, delayMs: githubDelayMs });
     const repoFullName = getRepoFullName(org, repo);
 
     const scopeLabel = repoFullName
@@ -1136,22 +1253,22 @@ async function main() {
         yarnItems = await searchRepoLockFiles(
           repoFullName,
           "yarn.lock",
-          headers
+          githubClient
         );
         pkgLockItems = await searchRepoLockFiles(
           repoFullName,
           "package-lock.json",
-          headers
+          githubClient
         );
         pnpmItems = await searchRepoLockFiles(
           repoFullName,
           "pnpm-lock.yaml",
-          headers
+          githubClient
         );
       } else {
-        yarnItems = await searchLockFiles(org, "yarn.lock", headers);
-        pkgLockItems = await searchLockFiles(org, "package-lock.json", headers);
-        pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", headers);
+        yarnItems = await searchLockFiles(org, "yarn.lock", githubClient);
+        pkgLockItems = await searchLockFiles(org, "package-lock.json", githubClient);
+        pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", githubClient);
       }
     } else {
       console.error(
@@ -1163,10 +1280,10 @@ async function main() {
           console.error(`Restricting tree discovery to repo ${repoFullName}.`);
           result = await listLockFilesViaTreesForRepoFullName(
             repoFullName,
-            headers
+            githubClient
           );
         } else {
-          result = await listLockFilesViaTrees(org, headers);
+          result = await listLockFilesViaTrees(org, githubClient);
         }
 
         const { yarn, npm, pnpm } = result;
@@ -1187,26 +1304,26 @@ async function main() {
           yarnItems = await searchRepoLockFiles(
             repoFullName,
             "yarn.lock",
-            headers
+            githubClient
           );
           pkgLockItems = await searchRepoLockFiles(
             repoFullName,
             "package-lock.json",
-            headers
+            githubClient
           );
           pnpmItems = await searchRepoLockFiles(
             repoFullName,
             "pnpm-lock.yaml",
-            headers
+            githubClient
           );
         } else {
-          yarnItems = await searchLockFiles(org, "yarn.lock", headers);
+          yarnItems = await searchLockFiles(org, "yarn.lock", githubClient);
           pkgLockItems = await searchLockFiles(
             org,
             "package-lock.json",
-            headers
+            githubClient
           );
-          pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", headers);
+          pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", githubClient);
         }
       }
     }
@@ -1226,7 +1343,7 @@ async function main() {
         content = await fetchFileContent(
           repoFullNameForItem,
           lockPath,
-          headers
+          githubClient
         );
       } catch (e) {
         console.error(
@@ -1257,7 +1374,7 @@ async function main() {
         content = await fetchFileContent(
           repoFullNameForItem,
           lockPath,
-          headers
+          githubClient
         );
       } catch (e) {
         console.error(
@@ -1288,7 +1405,7 @@ async function main() {
         content = await fetchFileContent(
           repoFullNameForItem,
           lockPath,
-          headers
+          githubClient
         );
       } catch (e) {
         console.error(

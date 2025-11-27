@@ -46,12 +46,18 @@ yarn start -- SocialGouv --discovery search
 
 # more conservative (ignore versions, match by name only)
 yarn start -- SocialGouv --no-version-check
+
+# add a small delay between GitHub API calls (in milliseconds)
+GITHUB_DELAY_MS=200 yarn start -- SocialGouv
+
+# or via CLI flag
+yarn start -- SocialGouv --github-delay-ms 200
 ```
 
 ### CLI options
 
 ```text
-node index.mjs <org> [--token TOKEN] [--no-version-check] [--packages-url URL] [--discovery trees|search]
+node index.mjs <org> [--token TOKEN] [--no-version-check] [--packages-url URL] [--discovery trees|search] [--github-delay-ms MS]
 ```
 
 - `<org>` (required): GitHub organization name
@@ -61,6 +67,7 @@ node index.mjs <org> [--token TOKEN] [--no-version-check] [--packages-url URL] [
 - `--discovery MODE`:
   - `trees` (default): walk Git trees of all non‑archived repos (default branch)
   - `search`: use GitHub `/search/code` only
+- `--github-delay-ms MS`: add an artificial delay (in milliseconds) before each GitHub API call. You can also set `GITHUB_DELAY_MS` in the environment. This helps avoid hitting GitHub’s rate limits on very large orgs.
 
 ## Output
 
