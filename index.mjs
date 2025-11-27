@@ -2,7 +2,7 @@
 /* index.mjs
  *
  * Scan a GitHub organization for Shai‑Hulud ("Second Coming") compromised
- * packages in yarn.lock / package-lock.json / pnpm-lock.yaml.
+ * packages in yarn.lock / package-lock.json / pnpm-lock.yaml / bun.lock.
  *
  * Requirements:
  *   - Node.js >= 18 (for native fetch)
@@ -549,6 +549,38 @@ function buildMatcher(compromisedMap, noVersionCheck) {
 }
 
 /**
+ * Best-effort normalization for Bun's bun.lock JSONC format.
+ * Strips line and block comments plus trailing commas so JSON.parse succeeds.
+ */
+function normalizeJsoncToJson(text) {
+  if (typeof text !== "string") return text;
+
+  // Remove // line comments (but avoid stripping URLs like "http://")
+  let withoutLineComments = text.replace(/(^|[^:])\/\/.*$/gm, (match, prefix) => prefix);
+
+  // Remove /* block */ comments
+  let withoutComments = withoutLineComments.replace(/\/\*[\s\S]*?\*\//g, "");
+
+  // Remove trailing commas before } or ]
+  let withoutTrailingCommas = withoutComments.replace(/,\s*([}\]])/g, "$1");
+
+  return withoutTrailingCommas;
+}
+
+/**
+ * Try to extract a semver-like version from a Bun resolution string.
+ * Examples:
+ *   "foo@1.2.3" -> "1.2.3"
+ *   "foo@npm:bar@1.2.3" -> "1.2.3"
+ *   "uWebSockets.js@github:uNetworking/uWebSockets.js#6609a88" -> null
+ */
+function extractVersionFromResolution(str) {
+  if (typeof str !== "string") return null;
+  const match = str.match(/(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/);
+  return match ? match[1] : null;
+}
+
+/**
  * Search all files with a given filename in an org using /search/code.
  * Limited to 1000 results by GitHub.
  */
@@ -663,7 +695,8 @@ async function fallbackSearchLockFilesForRepo(
   githubClient,
   yarnArray,
   npmArray,
-  pnpmArray
+  pnpmArray,
+  bunArray
 ) {
   try {
     console.error(`  -> Fallback /search/code for ${repoFullName}...`);
@@ -683,6 +716,11 @@ async function fallbackSearchLockFilesForRepo(
       "pnpm-lock.yaml",
       githubClient
     );
+    const bunItems = await searchRepoLockFiles(
+      repoFullName,
+      "bun.lock",
+      githubClient
+    );
 
     for (const item of yarnItems) {
       yarnArray.push({ repository: { full_name: repoFullName }, path: item.path });
@@ -692,6 +730,9 @@ async function fallbackSearchLockFilesForRepo(
     }
     for (const item of pnpmItems) {
       pnpmArray.push({ repository: { full_name: repoFullName }, path: item.path });
+    }
+    for (const item of bunItems) {
+      bunArray.push({ repository: { full_name: repoFullName }, path: item.path });
     }
   } catch (e) {
     console.error(
@@ -777,6 +818,7 @@ async function listLockFilesViaTreesForRepos(
   const yarn = [];
   const npm = [];
   const pnpm = [];
+  const bun = [];
 
   for (let index = 0; index < repos.length; index++) {
     const repo = repos[index];
@@ -820,7 +862,8 @@ async function listLockFilesViaTreesForRepos(
             githubClient,
             yarn,
             npm,
-            pnpm
+            pnpm,
+            bun
           );
         }
         continue;
@@ -849,7 +892,8 @@ async function listLockFilesViaTreesForRepos(
             githubClient,
             yarn,
             npm,
-            pnpm
+            pnpm,
+            bun
           );
         continue;
       }
@@ -863,6 +907,8 @@ async function listLockFilesViaTreesForRepos(
           npm.push({ repository: { full_name: repoFullName }, path: item.path });
         } else if (item.path.endsWith("pnpm-lock.yaml")) {
           pnpm.push({ repository: { full_name: repoFullName }, path: item.path });
+        } else if (item.path.endsWith("bun.lock")) {
+          bun.push({ repository: { full_name: repoFullName }, path: item.path });
         }
       }
     } catch (e) {
@@ -874,13 +920,14 @@ async function listLockFilesViaTreesForRepos(
         githubClient,
         yarn,
         npm,
-        pnpm
+        pnpm,
+        bun
       );
       continue;
     }
   }
 
-  return { yarn, npm, pnpm };
+  return { yarn, npm, pnpm, bun };
 }
 
 async function listLockFilesViaTrees(org, githubClient) {
@@ -1198,6 +1245,68 @@ export function checkPnpmLock(content, isCompromised) {
 }
 
 /**
+ * Analyse a bun.lock (Bun text lockfile) and return a list of compromised { name, version }.
+ *
+ * bun.lock is JSONC; we first normalize it to JSON and then inspect the `packages` map.
+ * For each entry:
+ *   "name": [resolution, meta, cacheKey]
+ * or
+ *   "name": { version, resolution, ... }
+ */
+export function checkBunLock(content, isCompromised) {
+  let data;
+  try {
+    const normalized = normalizeJsoncToJson(content);
+    data = JSON.parse(normalized);
+  } catch {
+    return [];
+  }
+
+  const pkgs = data && data.packages;
+  if (!pkgs || typeof pkgs !== "object") {
+    return [];
+  }
+
+  const matchesMap = new Map(); // key: "name@version"
+
+  const addMatch = (name, version) => {
+    if (!isCompromised(name, version)) return;
+    const key = `${name}@${version || "?"}`;
+    if (!matchesMap.has(key)) {
+      matchesMap.set(key, { name, version: version || null });
+    }
+  };
+
+  for (const [name, value] of Object.entries(pkgs)) {
+    if (!name) continue;
+    if (value == null) continue;
+
+    let version = null;
+
+    if (Array.isArray(value)) {
+      // Tuple-style: [resolution, meta?, cacheKey?]
+      const meta = value[1];
+      if (meta && typeof meta === "object" && typeof meta.version === "string") {
+        version = meta.version.trim();
+      }
+      if (!version && typeof value[0] === "string") {
+        version = extractVersionFromResolution(value[0]);
+      }
+    } else if (typeof value === "object") {
+      if (typeof value.version === "string") {
+        version = value.version.trim();
+      } else if (typeof value.resolution === "string") {
+        version = extractVersionFromResolution(value.resolution);
+      }
+    }
+
+    addMatch(name, version);
+  }
+
+  return Array.from(matchesMap.values());
+}
+
+/**
  * Main program.
  */
 function getRepoFullName(org, repoOption) {
@@ -1245,6 +1354,7 @@ async function main() {
     let yarnItems = [];
     let pkgLockItems = [];
     let pnpmItems = [];
+    let bunItems = [];
 
     if (discoveryMode === "search") {
       console.error("Discovery mode: GitHub /search/code only.");
@@ -1265,10 +1375,16 @@ async function main() {
           "pnpm-lock.yaml",
           githubClient
         );
+        bunItems = await searchRepoLockFiles(
+          repoFullName,
+          "bun.lock",
+          githubClient
+        );
       } else {
         yarnItems = await searchLockFiles(org, "yarn.lock", githubClient);
         pkgLockItems = await searchLockFiles(org, "package-lock.json", githubClient);
         pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", githubClient);
+        bunItems = await searchLockFiles(org, "bun.lock", githubClient);
       }
     } else {
       console.error(
@@ -1286,10 +1402,11 @@ async function main() {
           result = await listLockFilesViaTrees(org, githubClient);
         }
 
-        const { yarn, npm, pnpm } = result;
+        const { yarn, npm, pnpm, bun } = result;
         yarnItems = yarn;
         pkgLockItems = npm;
         pnpmItems = pnpm;
+        bunItems = bun;
       } catch (e) {
         console.error(
           `Error while enumerating lockfiles via Git trees: ${e.message}`
@@ -1316,6 +1433,11 @@ async function main() {
             "pnpm-lock.yaml",
             githubClient
           );
+          bunItems = await searchRepoLockFiles(
+            repoFullName,
+            "bun.lock",
+            githubClient
+          );
         } else {
           yarnItems = await searchLockFiles(org, "yarn.lock", githubClient);
           pkgLockItems = await searchLockFiles(
@@ -1324,6 +1446,7 @@ async function main() {
             githubClient
           );
           pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", githubClient);
+          bunItems = await searchLockFiles(org, "bun.lock", githubClient);
         }
       }
     }
@@ -1331,7 +1454,8 @@ async function main() {
     console.error("Lockfiles discovered:");
     console.error(`  yarn.lock         : ${yarnItems.length}`);
     console.error(`  package-lock.json : ${pkgLockItems.length}`);
-    console.error(`  pnpm-lock.yaml    : ${pnpmItems.length}\n`);
+    console.error(`  pnpm-lock.yaml    : ${pnpmItems.length}`);
+    console.error(`  bun.lock          : ${bunItems.length}\n`);
 
     // 3) Scan yarn.lock
     for (const item of yarnItems) {
@@ -1425,13 +1549,44 @@ async function main() {
         });
       }
     }
+
+    // 6) Scan bun.lock
+    for (const item of bunItems) {
+      const repoFullNameForItem = item.repository.full_name;
+      const lockPath = item.path;
+
+      let content;
+      try {
+        content = await fetchFileContent(
+          repoFullNameForItem,
+          lockPath,
+          githubClient
+        );
+      } catch (e) {
+        console.error(
+          `Error fetching ${repoFullNameForItem}/${lockPath}: ${e.message}`
+        );
+        continue;
+      }
+      if (!content) continue;
+
+      const matches = checkBunLock(content, isCompromised);
+      if (matches.length > 0) {
+        findings.push({
+          repo: repoFullNameForItem,
+          path: lockPath,
+          type: "bun.lock",
+          matches,
+        });
+      }
+    }
   }
 
-  // 6) Print results
+  // 7) Print results
   console.log(""); // clean separation
   if (findings.length === 0) {
     console.log(
-      "No Shai-Hulud compromised packages found in yarn.lock / package-lock.json / pnpm-lock.yaml in the organization."
+      "No Shai-Hulud compromised packages found in yarn.lock / package-lock.json / pnpm-lock.yaml / bun.lock in the organization."
     );
     process.exit(0);
   }

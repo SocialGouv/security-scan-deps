@@ -5,6 +5,7 @@ import {
   checkPackageLock,
   checkYarnLock,
   checkPnpmLock,
+  checkBunLock,
 } from "../index.mjs";
 
 // Helper: simple compromised matcher
@@ -266,5 +267,89 @@ test("checkPnpmLock: non-compromised returns empty array", () => {
   ].join("\n");
 
   const result = checkPnpmLock(content, () => false);
+  assert.deepEqual(result, []);
+});
+
+// --- checkBunLock tests ---
+
+test("checkBunLock: basic package from packages map", () => {
+  const content = JSON.stringify(
+    {
+      lockfileVersion: 0,
+      packages: {
+        foo: ["foo@1.2.3", {}, "cache-key"],
+      },
+    },
+    null,
+    2
+  );
+
+  const compromised = new Set(["foo@1.2.3"]);
+  const isCompromised = makeMatcher(compromised);
+
+  const result = checkBunLock(content, isCompromised);
+  assert.deepEqual(result, [{ name: "foo", version: "1.2.3" }]);
+});
+
+
+test("checkBunLock: non-semver resolution yields null version", () => {
+  const content = JSON.stringify(
+    {
+      packages: {
+        "uWebSockets.js": [
+          "uWebSockets.js@github:uNetworking/uWebSockets.js#6609a88",
+          {},
+          "uNetworking-uWebSockets.js-6609a88",
+        ],
+      },
+    },
+    null,
+    2
+  );
+
+  const compromised = new Set(["uWebSockets.js@?"]);
+  const isCompromised = makeMatcher(compromised);
+
+  const result = checkBunLock(content, isCompromised);
+  assert.deepEqual(result, [
+    { name: "uWebSockets.js", version: null },
+  ]);
+});
+
+
+test("checkBunLock: JSONC (comments & trailing commas)", () => {
+  const content = `{
+    // comment about packages
+    "packages": {
+      "foo": ["foo@1.2.3", {},],
+    },
+  }`;
+
+  const compromised = new Set(["foo@1.2.3"]);
+  const isCompromised = makeMatcher(compromised);
+
+  const result = checkBunLock(content, isCompromised);
+  assert.deepEqual(result, [{ name: "foo", version: "1.2.3" }]);
+});
+
+
+test("checkBunLock: non-compromised returns empty array", () => {
+  const content = JSON.stringify(
+    {
+      packages: {
+        foo: ["foo@1.2.3", {}, "k"],
+      },
+    },
+    null,
+    2
+  );
+
+  const result = checkBunLock(content, () => false);
+  assert.deepEqual(result, []);
+});
+
+
+test("checkBunLock: invalid JSON returns empty array", () => {
+  const result = checkBunLock("not json", () => true);
   assert.deepEqual(result, []);
 });
