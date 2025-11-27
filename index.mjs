@@ -16,8 +16,12 @@ import path from "node:path";
 
 const GITHUB_API_URL = "https://api.github.com";
 
-// Default URL to Tenable's list.md (raw)
+// Default URL to DataDog's consolidated CSV of compromised packages
 const DEFAULT_PACKAGE_LIST_URL =
+  "https://raw.githubusercontent.com/DataDog/indicators-of-compromise/refs/heads/main/shai-hulud-2.0/consolidated_iocs.csv";
+
+// Legacy Tenable Markdown list (list.md)
+const TENABLE_MARKDOWN_URL =
   "https://github.com/tenable/shai-hulud-second-coming-affected-packages/raw/main/list.md";
 
 /**
@@ -114,25 +118,13 @@ function buildGithubHeaders(token) {
 }
 
 /**
- * Load compromised packages from Tenable's Markdown (list.md).
+ * Parse compromised packages from a Markdown list (Tenable-style list.md).
  *
  * Returns Map<string, Set<string>> where:
  *   - key    : npm package name (e.g. "@scope/pkg" or "lodash")
  *   - values : set of malicious versions (empty Set => all versions)
  */
-async function loadCompromisedPackagesFromMarkdown(url) {
-  // If the URL is a blob URL, convert it to raw
-  let fetchUrl = url.replace("/blob/", "/raw/");
-
-  console.error(`Loading compromised package list from ${fetchUrl}...`);
-  const res = await fetch(fetchUrl);
-  if (!res.ok) {
-    throw new Error(
-      `Failed to download package list (${res.status} ${res.statusText})`
-    );
-  }
-  const text = await res.text();
-
+function parseCompromisedPackagesFromMarkdown(text) {
   const compromised = new Map();
   const lines = text.split(/\r?\n/);
 
@@ -193,11 +185,174 @@ async function loadCompromisedPackagesFromMarkdown(url) {
     }
   }
 
-  console.error(`  -> ${compromised.size} compromised packages parsed from markdown.`);
+  return compromised;
+}
+
+/**
+ * Parse compromised packages from DataDog's consolidated CSV.
+ *
+ * CSV format (simplified):
+ *   package_name,package_versions,sources
+ *   foo,1.0.0,"datadog, ..."
+ *   bar,"1.0.0, 2.0.0","datadog, ..."
+ *
+ * Semantics:
+ *   - If package_versions is empty => all versions compromised (empty Set)
+ *   - Otherwise, comma-separated list of specific versions.
+ */
+function parseCompromisedPackagesFromCsv(text) {
+  const compromised = new Map();
+  const lines = text.split(/\r?\n/);
+  if (lines.length === 0) return compromised;
+
+  const splitCsvLine = (line) => {
+    const result = [];
+    let current = "";
+    let inQuotes = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === "\"") {
+        if (inQuotes && line[i + 1] === "\"") {
+          // Escaped quote ""
+          current += "\"";
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === "," && !inQuotes) {
+        result.push(current);
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    result.push(current);
+    return result;
+  };
+
+  const unquote = (s) => {
+    const trimmed = s.trim();
+    if (trimmed.length >= 2 && trimmed.startsWith("\"") && trimmed.endsWith("\"")) {
+      return trimmed.slice(1, -1);
+    }
+    return trimmed;
+  };
+
+  let startIndex = 0;
+  if (lines[0].toLowerCase().startsWith("package_name,")) {
+    startIndex = 1; // skip header
+  }
+
+  for (let i = startIndex; i < lines.length; i++) {
+    const rawLine = lines[i];
+    if (!rawLine || !rawLine.trim()) continue;
+
+    const cols = splitCsvLine(rawLine);
+    if (cols.length === 0) continue;
+
+    const name = unquote(cols[0]);
+    if (!name) continue;
+
+    const rawVersions = cols.length > 1 ? unquote(cols[1]) : "";
+    const versionsCell = rawVersions.trim();
+
+    if (!compromised.has(name)) {
+      compromised.set(name, new Set());
+    }
+    const versionsSet = compromised.get(name);
+
+    if (!versionsCell) {
+      // No version specified => all versions considered compromised
+      // Convention: empty Set => all versions
+      versionsSet.clear();
+      continue;
+    }
+
+    // If we've already marked this package as "all versions" compromised,
+    // do not add specific versions.
+    if (versionsSet.size === 0) {
+      continue;
+    }
+
+    for (const part of versionsCell.split(",")) {
+      const v = part.trim();
+      if (v) {
+        versionsSet.add(v);
+      }
+    }
+  }
+
+  return compromised;
+}
+
+/**
+ * Merge multiple compromised maps.
+ * If any map marks a package as "all versions" (empty Set), the result is all versions.
+ */
+function mergeCompromisedMaps(...maps) {
+  const result = new Map();
+
+  for (const m of maps) {
+    for (const [name, versions] of m.entries()) {
+      if (!result.has(name)) {
+        result.set(name, new Set(versions));
+        continue;
+      }
+
+      const existing = result.get(name);
+
+      // If either side says "all versions", keep it as all versions
+      if (existing.size === 0 || versions.size === 0) {
+        existing.clear();
+        continue;
+      }
+
+      for (const v of versions) {
+        existing.add(v);
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Load compromised packages from a remote URL (CSV or Markdown).
+ *
+ * Returns Map<string, Set<string>> where:
+ *   - key    : npm package name (e.g. "@scope/pkg" or "lodash")
+ *   - values : set of malicious versions (empty Set => all versions)
+ */
+async function loadCompromisedPackagesFromMarkdown(url) {
+  // If the URL is a blob URL, convert it to raw
+  let fetchUrl = url.replace("/blob/", "/raw/");
+
+  console.error(`Loading compromised package list from ${fetchUrl}...`);
+  const res = await fetch(fetchUrl);
+  if (!res.ok) {
+    throw new Error(
+      `Failed to download package list (${res.status} ${res.statusText})`
+    );
+  }
+  const text = await res.text();
+
+  let compromised;
+  if (/\.csv($|[?#])/i.test(fetchUrl)) {
+    compromised = parseCompromisedPackagesFromCsv(text);
+    console.error(
+      `  -> ${compromised.size} compromised packages parsed from CSV.`
+    );
+  } else {
+    compromised = parseCompromisedPackagesFromMarkdown(text);
+    console.error(
+      `  -> ${compromised.size} compromised packages parsed from markdown.`
+    );
+  }
 
   if (compromised.size === 0) {
     console.error(
-      "Warning: no entries found in list.md. The format may have changed, or the regex is too strict."
+      "Warning: no entries found in package list. The format may have changed, or the parser is too strict."
     );
   }
 
@@ -219,80 +374,46 @@ async function loadCompromisedPackages({ packagesUrl, packagesFile }) {
       );
     }
 
-    const compromised = new Map();
-    const lines = text.split(/\r?\n/);
-
-    // 1) Try to parse the current Markdown table format
-    //    | Package Name | Vulnerable Versions |
-    const tableLines = lines.filter((l) => l.trim().startsWith("|"));
-    if (tableLines.length >= 3) {
-      // Skip header and separator
-      for (const line of tableLines.slice(2)) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed === "|" || /^\|\s*:?[-]+/.test(trimmed))
-          continue;
-
-        // Example: "| @scope/pkg | 1.2.3, 1.2.4 |"
-        const cells = trimmed
-          .split("|")
-          .map((c) => c.trim())
-          .filter(Boolean);
-
-        if (cells.length < 2) continue;
-
-        const name = cells[0];
-        const versionsCell = cells[1] || "";
-        if (!name) continue;
-
-        if (!compromised.has(name)) {
-          compromised.set(name, new Set());
-        }
-        const versionsSet = compromised.get(name);
-
-        const vTrimmed = versionsCell.trim();
-        if (!vTrimmed || vTrimmed === "-") {
-          // No version specified => all versions considered compromised
-          // Convention: empty Set => all versions
-        } else {
-          for (const part of vTrimmed.split(",")) {
-            const v = part.trim();
-            if (v) versionsSet.add(v);
-          }
-        }
-      }
+    const ext = path.extname(packagesFile).toLowerCase();
+    let compromised;
+    if (ext === ".csv") {
+      compromised = parseCompromisedPackagesFromCsv(text);
+      console.error(
+        `  -> ${compromised.size} compromised packages parsed from CSV.`
+      );
+    } else {
+      compromised = parseCompromisedPackagesFromMarkdown(text);
+      console.error(
+        `  -> ${compromised.size} compromised packages parsed from markdown.`
+      );
     }
-
-    // 2) Fallback: older "name@version" free-text format
-    if (compromised.size === 0) {
-      const pkgRegex =
-        /(@[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+|[a-zA-Z0-9._-]+)@([0-9][0-9A-Za-z.+-]*)/g;
-
-      for (const line of lines) {
-        let match;
-        while ((match = pkgRegex.exec(line)) !== null) {
-          const name = match[1].trim();
-          const version = match[2].trim();
-          if (!compromised.has(name)) {
-            compromised.set(name, new Set());
-          }
-          compromised.get(name).add(version);
-        }
-      }
-    }
-
-    console.error(
-      `  -> ${compromised.size} compromised packages parsed from markdown.`
-    );
 
     if (compromised.size === 0) {
       console.error(
-        "Warning: no entries found in list.md. The format may have changed, or the regex is too strict."
+        "Warning: no entries found in package list. The format may have changed, or the parser is too strict."
       );
     }
 
     return compromised;
   }
 
+  // No local file: use remote lists.
+  // If the caller did not override the packages URL, aggregate DataDog CSV
+  // and the legacy Tenable markdown list.
+  if (packagesUrl === DEFAULT_PACKAGE_LIST_URL) {
+    console.error(
+      "Using aggregated package list: DataDog CSV + Tenable Markdown (list.md)."
+    );
+    const datadog = await loadCompromisedPackagesFromMarkdown(
+      DEFAULT_PACKAGE_LIST_URL
+    );
+    const tenable = await loadCompromisedPackagesFromMarkdown(
+      TENABLE_MARKDOWN_URL
+    );
+    return mergeCompromisedMaps(datadog, tenable);
+  }
+
+  // If the user explicitly provided a URL, keep single-source behavior.
   return loadCompromisedPackagesFromMarkdown(packagesUrl);
 }
 
