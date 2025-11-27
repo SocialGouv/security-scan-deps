@@ -406,9 +406,24 @@ function mergeCompromisedMaps(...maps) {
 
       const existing = result.get(name);
 
-      // If either side says "all versions", keep it as all versions
-      if (existing.size === 0 || versions.size === 0) {
-        existing.clear();
+      // Merge semantics:
+      // - Empty Set => "all versions compromised"
+      // - Prefer specific versions over "all versions" when they conflict
+      if (existing.size === 0 && versions.size === 0) {
+        // Both sources say "all versions" -> keep as all versions
+        continue;
+      }
+
+      if (existing.size === 0 && versions.size > 0) {
+        // Narrow from "all versions" to specific versions
+        for (const v of versions) {
+          existing.add(v);
+        }
+        continue;
+      }
+
+      if (existing.size > 0 && versions.size === 0) {
+        // Already have specific versions; ignore broader "all versions" signal
         continue;
       }
 
@@ -547,6 +562,12 @@ function buildMatcher(compromisedMap, noVersionCheck) {
     return versions.has(version);
   };
 }
+
+// Internal exports for testing specific behaviors
+export const _testInternals = {
+  mergeCompromisedMaps,
+  buildMatcher,
+};
 
 /**
  * Best-effort normalization for Bun's bun.lock JSONC format.

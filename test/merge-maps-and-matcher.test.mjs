@@ -1,0 +1,81 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { _testInternals } from "../index.mjs";
+
+const { mergeCompromisedMaps, buildMatcher } = _testInternals;
+
+const makeAllVersionsMap = (entries) => {
+  const m = new Map();
+  for (const name of entries) {
+    m.set(name, new Set());
+  }
+  return m;
+};
+
+const makeVersionedMap = (obj) => {
+  const m = new Map();
+  for (const [name, versions] of Object.entries(obj)) {
+    m.set(name, new Set(versions));
+  }
+  return m;
+};
+
+// --- mergeCompromisedMaps semantics ---
+
+test("mergeCompromisedMaps: prefer specific versions over all-versions when conflicting", () => {
+  const allMap = makeAllVersionsMap(["foo"]);
+  const verMap = makeVersionedMap({ foo: ["1.0.0", "2.0.0"] });
+
+  const merged1 = mergeCompromisedMaps(allMap, verMap);
+  const merged2 = mergeCompromisedMaps(verMap, allMap);
+
+  for (const merged of [merged1, merged2]) {
+    const versions = merged.get("foo");
+    assert(versions, "foo should exist in merged map");
+    assert.equal(versions.size, 2);
+    assert(versions.has("1.0.0"));
+    assert(versions.has("2.0.0"));
+  }
+});
+
+
+test("mergeCompromisedMaps: all-versions preserved when no specific versions exist", () => {
+  const allMap = makeAllVersionsMap(["foo"]);
+  const other = makeVersionedMap({ bar: ["1.0.0"] });
+
+  const merged = mergeCompromisedMaps(allMap, other);
+
+  const fooVersions = merged.get("foo");
+  assert(fooVersions, "foo should exist in merged map");
+  assert.equal(fooVersions.size, 0, "foo should remain all-versions-compromised");
+
+  const barVersions = merged.get("bar");
+  assert(barVersions, "bar should exist in merged map");
+  assert.equal(barVersions.size, 1);
+  assert(barVersions.has("1.0.0"));
+});
+
+
+// --- buildMatcher semantics with empty vs non-empty sets ---
+
+test("buildMatcher: empty set => all versions compromised", () => {
+  const map = new Map([["foo", new Set()]]);
+  const isCompromised = buildMatcher(map, false);
+
+  assert.equal(isCompromised("foo", "1.0.0"), true);
+  assert.equal(isCompromised("foo", "999.0.0"), true);
+  assert.equal(isCompromised("foo", null), true);
+  assert.equal(isCompromised("bar", "1.0.0"), false);
+});
+
+
+test("buildMatcher: non-empty set => only listed versions compromised", () => {
+  const map = new Map([["foo", new Set(["1.0.0"])]]);
+  const isCompromised = buildMatcher(map, false);
+
+  assert.equal(isCompromised("foo", "1.0.0"), true);
+  assert.equal(isCompromised("foo", "2.0.0"), false);
+  assert.equal(isCompromised("foo", null), true, "unknown version stays conservative");
+  assert.equal(isCompromised("bar", "1.0.0"), false);
+});
