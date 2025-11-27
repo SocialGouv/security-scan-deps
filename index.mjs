@@ -11,6 +11,8 @@
  */
 
 import { pathToFileURL } from "node:url";
+import fs from "node:fs/promises";
+import path from "node:path";
 
 const GITHUB_API_URL = "https://api.github.com";
 
@@ -20,44 +22,84 @@ const DEFAULT_PACKAGE_LIST_URL =
 
 /**
  * CLI args parsing.
- * Usage: node index.mjs <org> [--token TOKEN] [--no-version-check] [--packages-url URL] [--discovery MODE]
+ *
+ * Remote mode (GitHub, default):
+ *   node index.mjs <org> [--repo REPO] [--token TOKEN] [--no-version-check]
+ *                      [--packages-url URL] [--packages-file PATH]
+ *                      [--discovery MODE]
+ *
+ * Local mode (scan current directory, no GitHub):
+ *   node index.mjs --local [--no-version-check]
+ *                           [--packages-url URL] [--packages-file PATH]
  */
 function parseArgs() {
   const argv = process.argv.slice(2);
-  if (argv.length === 0 || argv[0].startsWith("-")) {
-    console.error(
-      "Usage: node index.mjs <org> [--token TOKEN] [--no-version-check] [--packages-url URL] [--discovery MODE]"
-    );
+
+  const usage =
+    "Usage: node index.mjs <org> [--repo REPO] [--token TOKEN] [--no-version-check] [--packages-url URL] [--packages-file PATH] [--discovery MODE]\n" +
+    "   or: node index.mjs --local [--no-version-check] [--packages-url URL] [--packages-file PATH]";
+
+  if (argv.length === 0) {
+    console.error(usage);
     process.exit(1);
   }
 
-  const org = argv[0];
+  let mode = "remote"; // "remote" (GitHub) or "local" (current directory)
+  let org = null;
+  let repo = null;
   let token = process.env.GITHUB_TOKEN || null;
   let noVersionCheck = false;
   let packagesUrl = DEFAULT_PACKAGE_LIST_URL;
+  let packagesFile = null;
   let discoveryMode = "trees"; // "trees" (default) or "search"
 
-  for (let i = 1; i < argv.length; i++) {
+  let i = 0;
+  if (argv[0] === "--local") {
+    mode = "local";
+    i = 1;
+  } else {
+    if (argv[0].startsWith("-")) {
+      console.error(usage);
+      process.exit(1);
+    }
+    org = argv[0];
+    i = 1;
+  }
+
+  for (; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--token" && argv[i + 1]) {
-      token = argv[++i];
-    } else if (arg === "--no-version-check") {
+    if (arg === "--no-version-check") {
       noVersionCheck = true;
     } else if (arg === "--packages-url" && argv[i + 1]) {
       packagesUrl = argv[++i];
-    } else if (arg === "--discovery" && argv[i + 1]) {
+    } else if (arg === "--packages-file" && argv[i + 1]) {
+      packagesFile = argv[++i];
+    } else if (mode === "remote" && arg === "--token" && argv[i + 1]) {
+      token = argv[++i];
+    } else if (mode === "remote" && arg === "--repo" && argv[i + 1]) {
+      repo = argv[++i];
+    } else if (mode === "remote" && arg === "--discovery" && argv[i + 1]) {
       discoveryMode = argv[++i];
     }
   }
 
-  if (!token) {
+  if (mode === "remote" && !token) {
     console.error(
       "Error: no GitHub token provided. Use --token or the GITHUB_TOKEN environment variable."
     );
     process.exit(1);
   }
 
-  return { org, token, noVersionCheck, packagesUrl, discoveryMode };
+  return {
+    mode,
+    org,
+    repo,
+    token,
+    noVersionCheck,
+    packagesUrl,
+    packagesFile,
+    discoveryMode,
+  };
 }
 
 /**
@@ -160,6 +202,98 @@ async function loadCompromisedPackagesFromMarkdown(url) {
   }
 
   return compromised;
+}
+
+async function loadCompromisedPackages({ packagesUrl, packagesFile }) {
+  if (packagesFile) {
+    console.error(
+      `Loading compromised package list from local file ${packagesFile}...`
+    );
+
+    let text;
+    try {
+      text = await fs.readFile(packagesFile, "utf8");
+    } catch (e) {
+      throw new Error(
+        `Failed to read local package list file "${packagesFile}": ${e.message}`
+      );
+    }
+
+    const compromised = new Map();
+    const lines = text.split(/\r?\n/);
+
+    // 1) Try to parse the current Markdown table format
+    //    | Package Name | Vulnerable Versions |
+    const tableLines = lines.filter((l) => l.trim().startsWith("|"));
+    if (tableLines.length >= 3) {
+      // Skip header and separator
+      for (const line of tableLines.slice(2)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed === "|" || /^\|\s*:?[-]+/.test(trimmed))
+          continue;
+
+        // Example: "| @scope/pkg | 1.2.3, 1.2.4 |"
+        const cells = trimmed
+          .split("|")
+          .map((c) => c.trim())
+          .filter(Boolean);
+
+        if (cells.length < 2) continue;
+
+        const name = cells[0];
+        const versionsCell = cells[1] || "";
+        if (!name) continue;
+
+        if (!compromised.has(name)) {
+          compromised.set(name, new Set());
+        }
+        const versionsSet = compromised.get(name);
+
+        const vTrimmed = versionsCell.trim();
+        if (!vTrimmed || vTrimmed === "-") {
+          // No version specified => all versions considered compromised
+          // Convention: empty Set => all versions
+        } else {
+          for (const part of vTrimmed.split(",")) {
+            const v = part.trim();
+            if (v) versionsSet.add(v);
+          }
+        }
+      }
+    }
+
+    // 2) Fallback: older "name@version" free-text format
+    if (compromised.size === 0) {
+      const pkgRegex =
+        /(@[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+|[a-zA-Z0-9._-]+)@([0-9][0-9A-Za-z.+-]*)/g;
+
+      for (const line of lines) {
+        let match;
+        while ((match = pkgRegex.exec(line)) !== null) {
+          const name = match[1].trim();
+          const version = match[2].trim();
+          if (!compromised.has(name)) {
+            compromised.set(name, new Set());
+          }
+          compromised.get(name).add(version);
+        }
+      }
+    }
+
+    console.error(
+      `  -> ${compromised.size} compromised packages parsed from markdown.`
+    );
+
+    if (compromised.size === 0) {
+      console.error(
+        "Warning: no entries found in list.md. The format may have changed, or the regex is too strict."
+      );
+    }
+
+    return compromised;
+  }
+
+  return loadCompromisedPackagesFromMarkdown(packagesUrl);
 }
 
 /**
@@ -398,8 +532,11 @@ async function listOrgRepos(org, headers) {
  * Discover yarn.lock / package-lock.json / pnpm-lock.yaml by walking Git trees
  * of the default branches of all repos in the org.
  */
-async function listLockFilesViaTrees(org, headers) {
-  const repos = await listOrgRepos(org, headers);
+async function listLockFilesViaTreesForRepos(
+  repos,
+  headers,
+  { includeArchived = false } = {}
+) {
   console.error(
     `Discovering lockfiles via Git trees across ${repos.length} repos...`
   );
@@ -411,7 +548,7 @@ async function listLockFilesViaTrees(org, headers) {
     const repo = repos[index];
     const repoFullName = repo.full_name;
 
-    if (repo.archived) {
+    if (repo.archived && !includeArchived) {
       console.error(
         `[${index + 1}/${repos.length}] Archived repo, skipping: ${repoFullName}`
       );
@@ -510,6 +647,29 @@ async function listLockFilesViaTrees(org, headers) {
   }
 
   return { yarn, npm, pnpm };
+}
+
+async function listLockFilesViaTrees(org, headers) {
+  const repos = await listOrgRepos(org, headers);
+  return listLockFilesViaTreesForRepos(repos, headers, { includeArchived: false });
+}
+
+async function listLockFilesViaTreesForRepoFullName(repoFullName, headers) {
+  console.error(
+    `Listing single repo "${repoFullName}" via /repos/:owner/:repo...`
+  );
+  const url = `${GITHUB_API_URL}/repos/${repoFullName}`;
+  const res = await fetch(url, { headers });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(
+      `Error calling /repos/${repoFullName} (${res.status} ${res.statusText}): ${body}`
+    );
+  }
+
+  const repo = await res.json();
+  return listLockFilesViaTreesForRepos([repo], headers, { includeArchived: true });
 }
 
 /**
@@ -681,11 +841,44 @@ export function checkYarnLock(content, isCompromised) {
  * packages:
  *   "/foo@1.2.3":
  *   "@scope/bar@4.5.6":
+ *
+ * We also try to be alias-aware:
+ *   /foo@npm:bar@1.0.0:
+ *     name: foo
+ *     id: bar/1.0.0
+ *   In that case we will consider both "foo" and "bar" as potential
+ *   package names for matching against the compromised list.
  */
 export function checkPnpmLock(content, isCompromised) {
   const lines = content.split(/\r?\n/);
   const matchesMap = new Map();
   let inPackages = false;
+
+  // State for the current package block
+  let currentNames = new Set();
+  let currentVersion = null;
+  let hasCurrent = false;
+
+  const flushCurrent = () => {
+    if (!hasCurrent || currentNames.size === 0) {
+      currentNames = new Set();
+      currentVersion = null;
+      hasCurrent = false;
+      return;
+    }
+
+    for (const name of currentNames) {
+      if (!isCompromised(name, currentVersion)) continue;
+      const id = `${name}@${currentVersion || "?"}`;
+      if (!matchesMap.has(id)) {
+        matchesMap.set(id, { name, version: currentVersion || null });
+      }
+    }
+
+    currentNames = new Set();
+    currentVersion = null;
+    hasCurrent = false;
+  };
 
   for (const rawLine of lines) {
     const line = rawLine;
@@ -698,42 +891,72 @@ export function checkPnpmLock(content, isCompromised) {
       continue;
     }
 
-    // Leave packages section: next top-level block
-    if (inPackages && !line.startsWith(" ") && trimmed.endsWith(":")) {
+    if (!inPackages) continue;
+
+    // Leave packages section: next top-level block after packages
+    if (!line.startsWith(" ") && trimmed.endsWith(":") && trimmed !== "packages:") {
+      flushCurrent();
       break;
     }
-
-    if (!inPackages) continue;
 
     // Package key lines, typically indented by 2 spaces
     //   "  /foo@1.2.3:" or "  \"@scope/bar@4.5.6\":"
     if (/^\s{2}\S/.test(line) && trimmed.endsWith(":")) {
+      // Starting a new package block
+      flushCurrent();
+
       let key = trimmed.slice(0, -1).trim(); // remove ':' at end
       key = key.replace(/^"|"$/g, "").replace(/^'|'$/g, "");
 
       const atIndex = key.lastIndexOf("@");
-      if (atIndex <= 0) continue;
+      if (atIndex > 0) {
+        let namePart = key.slice(0, atIndex).trim();
+        let versionPart = key.slice(atIndex + 1).trim();
 
-      let name = key.slice(0, atIndex).trim();
-      let version = key.slice(atIndex + 1).trim();
+        // Normalize name: remove leading "/" or "/@scope/..."
+        if (namePart.startsWith("/@")) {
+          namePart = namePart.slice(1); // "@scope/name"
+        } else if (namePart.startsWith("/")) {
+          namePart = namePart.slice(1); // "foo"
+        }
 
-      // Normalize name: remove leading "/" or "/@scope/..."
-      if (name.startsWith("/@")) {
-        name = name.slice(1); // "@scope/name"
-      } else if (name.startsWith("/")) {
-        name = name.slice(1); // "foo"
+        if (namePart) {
+          currentNames.add(namePart);
+          currentVersion = versionPart || null;
+          hasCurrent = true;
+        }
       }
 
-      if (!name) continue;
+      continue;
+    }
 
-      if (!isCompromised(name, version)) continue;
+    // Inside a package block, collect additional hints for real package name
+    if (hasCurrent) {
+      // Prefer explicit name: field when present
+      if (trimmed.startsWith("name")) {
+        const m = trimmed.match(/^name\s*:\s*["']?([^"']+)["']?/);
+        if (m && m[1]) {
+          currentNames.add(m[1].trim());
+        }
+      }
 
-      const id = `${name}@${version || "?"}`;
-      if (!matchesMap.has(id)) {
-        matchesMap.set(id, { name, version: version || null });
+      // pnpm often stores an id like "bar/1.0.0" for the real package
+      if (trimmed.startsWith("id")) {
+        const m = trimmed.match(/^id\s*:\s*["']?([^"']+)["']?/);
+        if (m && m[1]) {
+          const idValue = m[1].trim();
+          const slashIndex = idValue.indexOf("/");
+          const idName = slashIndex > 0 ? idValue.slice(0, slashIndex) : idValue;
+          if (idName) {
+            currentNames.add(idName);
+          }
+        }
       }
     }
   }
+
+  // Flush the last package block, if any
+  flushCurrent();
 
   return Array.from(matchesMap.values());
 }
@@ -741,125 +964,228 @@ export function checkPnpmLock(content, isCompromised) {
 /**
  * Main program.
  */
+function getRepoFullName(org, repoOption) {
+  if (!repoOption) return null;
+  return repoOption.includes("/") ? repoOption : `${org}/${repoOption}`;
+}
+
 async function main() {
-  const { org, token, noVersionCheck, packagesUrl, discoveryMode } = parseArgs();
-  const headers = buildGithubHeaders(token);
+  const {
+    mode,
+    org,
+    repo,
+    token,
+    noVersionCheck,
+    packagesUrl,
+    packagesFile,
+    discoveryMode,
+  } = parseArgs();
 
   // 1) Load compromised package list
-  const compromisedMap = await loadCompromisedPackagesFromMarkdown(packagesUrl);
+  const compromisedMap = await loadCompromisedPackages({
+    packagesUrl,
+    packagesFile,
+  });
   const isCompromised = buildMatcher(compromisedMap, noVersionCheck);
 
-  // 2) Discover lockfiles in the org
-  console.error(`\nScanning GitHub organization "${org}" for lockfiles...\n`);
+  let findings = [];
 
-  let yarnItems = [];
-  let pkgLockItems = [];
-  let pnpmItems = [];
-
-  if (discoveryMode === "search") {
-    console.error("Discovery mode: GitHub /search/code only.");
-    yarnItems = await searchLockFiles(org, "yarn.lock", headers);
-    pkgLockItems = await searchLockFiles(org, "package-lock.json", headers);
-    pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", headers);
+  if (mode === "local") {
+    const rootDir = process.cwd();
+    findings = await scanLocalDirectory(rootDir, isCompromised);
   } else {
-    console.error(
-      "Discovery mode: Git trees for all repos (default, more exhaustive)."
-    );
-    try {
-      const { yarn, npm, pnpm } = await listLockFilesViaTrees(org, headers);
-      yarnItems = yarn;
-      pkgLockItems = npm;
-      pnpmItems = pnpm;
-    } catch (e) {
+    const headers = buildGithubHeaders(token);
+    const repoFullName = getRepoFullName(org, repo);
+
+    const scopeLabel = repoFullName
+      ? `repository "${repoFullName}"`
+      : `organization "${org}"`;
+
+    // 2) Discover lockfiles in the org or a specific repo
+    console.error(`\nScanning GitHub ${scopeLabel} for lockfiles...\n`);
+
+    let yarnItems = [];
+    let pkgLockItems = [];
+    let pnpmItems = [];
+
+    if (discoveryMode === "search") {
+      console.error("Discovery mode: GitHub /search/code only.");
+      if (repoFullName) {
+        console.error(`Restricting search to repo ${repoFullName}.`);
+        yarnItems = await searchRepoLockFiles(
+          repoFullName,
+          "yarn.lock",
+          headers
+        );
+        pkgLockItems = await searchRepoLockFiles(
+          repoFullName,
+          "package-lock.json",
+          headers
+        );
+        pnpmItems = await searchRepoLockFiles(
+          repoFullName,
+          "pnpm-lock.yaml",
+          headers
+        );
+      } else {
+        yarnItems = await searchLockFiles(org, "yarn.lock", headers);
+        pkgLockItems = await searchLockFiles(org, "package-lock.json", headers);
+        pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", headers);
+      }
+    } else {
       console.error(
-        `Error while enumerating lockfiles via Git trees: ${e.message}`
+        "Discovery mode: Git trees for all repos (default, more exhaustive)."
       );
-      console.error("Falling back to GitHub /search/code for the whole org...");
-      yarnItems = await searchLockFiles(org, "yarn.lock", headers);
-      pkgLockItems = await searchLockFiles(org, "package-lock.json", headers);
-      pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", headers);
+      try {
+        let result;
+        if (repoFullName) {
+          console.error(`Restricting tree discovery to repo ${repoFullName}.`);
+          result = await listLockFilesViaTreesForRepoFullName(
+            repoFullName,
+            headers
+          );
+        } else {
+          result = await listLockFilesViaTrees(org, headers);
+        }
+
+        const { yarn, npm, pnpm } = result;
+        yarnItems = yarn;
+        pkgLockItems = npm;
+        pnpmItems = pnpm;
+      } catch (e) {
+        console.error(
+          `Error while enumerating lockfiles via Git trees: ${e.message}`
+        );
+        console.error(
+          repoFullName
+            ? `Falling back to GitHub /search/code for repo ${repoFullName}...`
+            : "Falling back to GitHub /search/code for the whole org..."
+        );
+
+        if (repoFullName) {
+          yarnItems = await searchRepoLockFiles(
+            repoFullName,
+            "yarn.lock",
+            headers
+          );
+          pkgLockItems = await searchRepoLockFiles(
+            repoFullName,
+            "package-lock.json",
+            headers
+          );
+          pnpmItems = await searchRepoLockFiles(
+            repoFullName,
+            "pnpm-lock.yaml",
+            headers
+          );
+        } else {
+          yarnItems = await searchLockFiles(org, "yarn.lock", headers);
+          pkgLockItems = await searchLockFiles(
+            org,
+            "package-lock.json",
+            headers
+          );
+          pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", headers);
+        }
+      }
     }
-  }
 
-  console.error("Lockfiles discovered:");
-  console.error(`  yarn.lock         : ${yarnItems.length}`);
-  console.error(`  package-lock.json : ${pkgLockItems.length}`);
-  console.error(`  pnpm-lock.yaml    : ${pnpmItems.length}\n`);
+    console.error("Lockfiles discovered:");
+    console.error(`  yarn.lock         : ${yarnItems.length}`);
+    console.error(`  package-lock.json : ${pkgLockItems.length}`);
+    console.error(`  pnpm-lock.yaml    : ${pnpmItems.length}\n`);
 
-  const findings = [];
+    // 3) Scan yarn.lock
+    for (const item of yarnItems) {
+      const repoFullNameForItem = item.repository.full_name;
+      const lockPath = item.path;
 
-  // 3) Scan yarn.lock
-  for (const item of yarnItems) {
-    const repoFullName = item.repository.full_name;
-    const path = item.path;
+      let content;
+      try {
+        content = await fetchFileContent(
+          repoFullNameForItem,
+          lockPath,
+          headers
+        );
+      } catch (e) {
+        console.error(
+          `Error fetching ${repoFullNameForItem}/${lockPath}: ${e.message}`
+        );
+        continue;
+      }
+      if (!content) continue;
 
-    let content;
-    try {
-      content = await fetchFileContent(repoFullName, path, headers);
-    } catch (e) {
-      console.error(`Error fetching ${repoFullName}/${path}: ${e.message}`);
-      continue;
+      const matches = checkYarnLock(content, isCompromised);
+      if (matches.length > 0) {
+        findings.push({
+          repo: repoFullNameForItem,
+          path: lockPath,
+          type: "yarn.lock",
+          matches,
+        });
+      }
     }
-    if (!content) continue;
 
-    const matches = checkYarnLock(content, isCompromised);
-    if (matches.length > 0) {
-      findings.push({
-        repo: repoFullName,
-        path,
-        type: "yarn.lock",
-        matches,
-      });
+    // 4) Scan package-lock.json
+    for (const item of pkgLockItems) {
+      const repoFullNameForItem = item.repository.full_name;
+      const lockPath = item.path;
+
+      let content;
+      try {
+        content = await fetchFileContent(
+          repoFullNameForItem,
+          lockPath,
+          headers
+        );
+      } catch (e) {
+        console.error(
+          `Error fetching ${repoFullNameForItem}/${lockPath}: ${e.message}`
+        );
+        continue;
+      }
+      if (!content) continue;
+
+      const matches = checkPackageLock(content, isCompromised);
+      if (matches.length > 0) {
+        findings.push({
+          repo: repoFullNameForItem,
+          path: lockPath,
+          type: "package-lock.json",
+          matches,
+        });
+      }
     }
-  }
 
-  // 4) Scan package-lock.json
-  for (const item of pkgLockItems) {
-    const repoFullName = item.repository.full_name;
-    const path = item.path;
+    // 5) Scan pnpm-lock.yaml
+    for (const item of pnpmItems) {
+      const repoFullNameForItem = item.repository.full_name;
+      const lockPath = item.path;
 
-    let content;
-    try {
-      content = await fetchFileContent(repoFullName, path, headers);
-    } catch (e) {
-      console.error(`Error fetching ${repoFullName}/${path}: ${e.message}`);
-      continue;
-    }
-    if (!content) continue;
+      let content;
+      try {
+        content = await fetchFileContent(
+          repoFullNameForItem,
+          lockPath,
+          headers
+        );
+      } catch (e) {
+        console.error(
+          `Error fetching ${repoFullNameForItem}/${lockPath}: ${e.message}`
+        );
+        continue;
+      }
+      if (!content) continue;
 
-    const matches = checkPackageLock(content, isCompromised);
-    if (matches.length > 0) {
-      findings.push({
-        repo: repoFullName,
-        path,
-        type: "package-lock.json",
-        matches,
-      });
-    }
-  }
-
-  // 5) Scan pnpm-lock.yaml
-  for (const item of pnpmItems) {
-    const repoFullName = item.repository.full_name;
-    const path = item.path;
-
-    let content;
-    try {
-      content = await fetchFileContent(repoFullName, path, headers);
-    } catch (e) {
-      console.error(`Error fetching ${repoFullName}/${path}: ${e.message}`);
-      continue;
-    }
-    if (!content) continue;
-
-    const matches = checkPnpmLock(content, isCompromised);
-    if (matches.length > 0) {
-      findings.push({
-        repo: repoFullName,
-        path,
-        type: "pnpm-lock.yaml",
-        matches,
-      });
+      const matches = checkPnpmLock(content, isCompromised);
+      if (matches.length > 0) {
+        findings.push({
+          repo: repoFullNameForItem,
+          path: lockPath,
+          type: "pnpm-lock.yaml",
+          matches,
+        });
+      }
     }
   }
 

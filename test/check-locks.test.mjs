@@ -170,6 +170,40 @@ test("checkPnpmLock: unscoped package in packages section", () => {
 });
 
 
+test("checkPnpmLock: alias with name field detects real package", () => {
+  const content = [
+    "packages:",
+    "  /foo@npm:bar@1.0.0:",
+    "    name: bar",
+    "    resolution: { integrity: 'sha512-...' }",
+    "",
+  ].join("\n");
+
+  const compromised = new Set(["bar@1.0.0"]);
+  const isCompromised = makeMatcher(compromised);
+
+  const result = checkPnpmLock(content, isCompromised);
+  assert.deepEqual(result, [{ name: "bar", version: "1.0.0" }]);
+});
+
+
+test("checkPnpmLock: alias with id field detects real package", () => {
+  const content = [
+    "packages:",
+    "  /foo@npm:bar@1.0.0:",
+    "    id: bar/1.0.0",
+    "    resolution: { integrity: 'sha512-...' }",
+    "",
+  ].join("\n");
+
+  const compromised = new Set(["bar@1.0.0"]);
+  const isCompromised = makeMatcher(compromised);
+
+  const result = checkPnpmLock(content, isCompromised);
+  assert.deepEqual(result, [{ name: "bar", version: "1.0.0" }]);
+});
+
+
 test("checkPnpmLock: scoped package with leading slash", () => {
   const content = [
     "packages:",
