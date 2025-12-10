@@ -1,23 +1,24 @@
 # security-scan-deps
 
-Scan a GitHub organization (or a single repo, or a local directory) for dependencies compromised in the
-[Tenable Shai‑Hulud / "Second Coming"](https://github.com/tenable/shai-hulud-second-coming-affected-packages) incident.
+Scan a GitHub organization (or a single repo, or a local directory) for dependencies that appear in one or more
+vulnerable package lists (for example the DataDog/Tenable Shai‑Hulud IOC list,
+CERT-FR advisories, or your own CSV/Markdown file).
 
 ## What it does
 
-- Loads a list of compromised npm packages from:
-  - DataDog’s consolidated Shai‑Hulud CSV, and
+- Loads a list of vulnerable npm packages from:
+  - DataDog’s consolidated Shai‑Hulud CSV (by default), and
   - Tenable’s legacy Markdown list (`list.md`),
   - optionally a custom URL or local file.
-- Merges these sources into a single map of compromised packages / versions.
+- Merges these sources into a single map of vulnerable packages / versions.
 - Scans for lockfiles:
   - `yarn.lock` (Yarn v1 / v2+ / Berry)
   - `package-lock.json` (npm v1–v3)
   - `pnpm-lock.yaml` (pnpm)
   - `bun.lock` (Bun)
-- For each lockfile, checks dependency **name + version** against the compromised list
+- For each lockfile, checks dependency **name + version** against the vulnerable list
   (name-only if `--no-version-check` is enabled).
-- Prints any compromised packages, grouped per repo (GitHub mode) or per file (local mode).
+- Prints any vulnerable packages, grouped per repo (GitHub mode) or per file (local mode).
 
 ## Requirements
 
@@ -106,6 +107,11 @@ Options:
   - You can pass either `owner/repo` or just `repo` (in which case `owner` is `<org>`).
 - `--token TOKEN`: GitHub token (if not using the `GITHUB_TOKEN` env var).
 - `--no-version-check`: match by package **name only** (more noisy, but conservative).
+  When version checking is enabled (default), the tool supports:
+  - exact versions: `1.2.3`
+  - wildcard versions with `x`: `15.0.x`, `15.x`
+  - simple range expressions using `>=`, `>`, `<`, `<=`, `=`
+    (e.g. `">=15.0.0 <15.0.5"`).
 - `--packages-url URL`: override the default remote package list URL.
   - If you override this, **only that URL** is used (no DataDog+Tenable aggregation).
 - `--packages-file PATH`: load the compromised package list from a local file
@@ -141,7 +147,5 @@ Compromised packages detected:
 If nothing is found, you’ll see:
 
 ```text
-No Shai-Hulud compromised packages found in yarn.lock / package-lock.json / pnpm-lock.yaml / bun.lock in the organization.
+No vulnerable dependencies found in yarn.lock / package-lock.json / pnpm-lock.yaml / bun.lock in the scanned scope.
 ```
-
-(When running in local mode, the wording still refers to "the organization" but the meaning is "in the scanned scope".)

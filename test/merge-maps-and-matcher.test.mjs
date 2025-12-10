@@ -71,11 +71,70 @@ test("buildMatcher: empty set => all versions compromised", () => {
 
 
 test("buildMatcher: non-empty set => only listed versions compromised", () => {
-  const map = new Map([["foo", new Set(["1.0.0"])]]);
+  const map = new Map([["foo", new Set(["1.0.0"] )]]);
   const isCompromised = buildMatcher(map, false);
 
   assert.equal(isCompromised("foo", "1.0.0"), true);
   assert.equal(isCompromised("foo", "2.0.0"), false);
   assert.equal(isCompromised("foo", null), true, "unknown version stays conservative");
   assert.equal(isCompromised("bar", "1.0.0"), false);
+});
+
+// --- buildMatcher: wildcard versions with x ---
+
+test("buildMatcher: wildcard 15.0.x matches only 15.0.*", () => {
+  const map = makeVersionedMap({ foo: ["15.0.x"] });
+  const isCompromised = buildMatcher(map, false);
+
+  assert.equal(isCompromised("foo", "15.0.0"), true);
+  assert.equal(isCompromised("foo", "15.0.99"), true);
+  assert.equal(isCompromised("foo", "15.1.0"), false);
+  assert.equal(isCompromised("foo", "14.9.9"), false);
+});
+
+
+test("buildMatcher: wildcard 15.x matches any 15.*.*", () => {
+  const map = makeVersionedMap({ foo: ["15.x"] });
+  const isCompromised = buildMatcher(map, false);
+
+  assert.equal(isCompromised("foo", "15.0.0"), true);
+  assert.equal(isCompromised("foo", "15.9.9"), true);
+  assert.equal(isCompromised("foo", "14.9.9"), false);
+  assert.equal(isCompromised("foo", "16.0.0"), false);
+});
+
+// --- buildMatcher: range expressions ---
+
+test("buildMatcher: range >=15.0.0 <15.0.5", () => {
+  const map = makeVersionedMap({ foo: [">=15.0.0 <15.0.5"] });
+  const isCompromised = buildMatcher(map, false);
+
+  assert.equal(isCompromised("foo", "15.0.0"), true);
+  assert.equal(isCompromised("foo", "15.0.1"), true);
+  assert.equal(isCompromised("foo", "15.0.4"), true);
+  assert.equal(isCompromised("foo", "15.0.5"), false);
+  assert.equal(isCompromised("foo", "14.9.9"), false);
+  assert.equal(isCompromised("foo", "15.1.0"), false);
+});
+
+
+test("buildMatcher: combination of exact, wildcard and range", () => {
+  const map = makeVersionedMap({
+    foo: ["1.0.0", "2.x", ">=3.0.0 <3.0.3"],
+  });
+  const isCompromised = buildMatcher(map, false);
+
+  // exact
+  assert.equal(isCompromised("foo", "1.0.0"), true);
+  assert.equal(isCompromised("foo", "1.0.1"), false);
+
+  // wildcard
+  assert.equal(isCompromised("foo", "2.0.0"), true);
+  assert.equal(isCompromised("foo", "2.5.1"), true);
+  assert.equal(isCompromised("foo", "3.2.0"), false);
+
+  // range
+  assert.equal(isCompromised("foo", "3.0.0"), true);
+  assert.equal(isCompromised("foo", "3.0.2"), true);
+  assert.equal(isCompromised("foo", "3.0.3"), false);
 });

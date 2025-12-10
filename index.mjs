@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 /* index.mjs
  *
- * Scan a GitHub organization for Shai‑Hulud ("Second Coming") compromised
- * packages in yarn.lock / package-lock.json / pnpm-lock.yaml / bun.lock.
+ * Scan a GitHub organization (or a single repo, or a local directory) for
+ * dependencies that appear in one or more vulnerable package lists
+ * (e.g. DataDog/Tenable Shai‑Hulud IOC list, CERT-FR advisories, or a
+ * custom CSV/Markdown list) in yarn.lock / package-lock.json /
+ * pnpm-lock.yaml / bun.lock.
  *
  * Requirements:
  *   - Node.js >= 18 (for native fetch)
@@ -537,11 +540,198 @@ async function loadCompromisedPackages({ packagesUrl, packagesFile }) {
 }
 
 /**
+ * Parse a numeric semver-like version string into { major, minor, patch }.
+ * - Extracts the first "MAJOR.MINOR.PATCH" triple it finds.
+ * - Ignores any pre-release / build metadata.
+ */
+function parseNumericVersion(str) {
+  if (typeof str !== "string") return null;
+  const m = str.match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return null;
+  return {
+    major: Number.parseInt(m[1], 10),
+    minor: Number.parseInt(m[2], 10),
+    patch: Number.parseInt(m[3], 10),
+  };
+}
+
+/**
+ * Parse a wildcard pattern like "15.0.x" or "15.x" or "x" into numeric segments
+ * where any segment equal to null is a wildcard.
+ */
+function parseWildcardPattern(str) {
+  if (typeof str !== "string") return null;
+  const parts = str.split(".");
+  if (parts.length === 0 || parts.length > 3) return null;
+
+  const segs = [null, null, null];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i].trim();
+    if (!part || part.toLowerCase() === "x") {
+      segs[i] = null; // wildcard
+    } else if (/^\d+$/.test(part)) {
+      segs[i] = Number.parseInt(part, 10);
+    } else {
+      // Not a pure number or 'x' -> not a valid simple wildcard pattern
+      return null;
+    }
+  }
+
+  return {
+    major: segs[0],
+    minor: segs[1],
+    patch: segs[2],
+  };
+}
+
+/**
+ * Compare two numeric versions a vs b.
+ * Returns -1 if a<b, 0 if a==b, 1 if a>b.
+ */
+function compareNumericVersions(a, b) {
+  if (a.major !== b.major) return a.major < b.major ? -1 : 1;
+  if (a.minor !== b.minor) return a.minor < b.minor ? -1 : 1;
+  if (a.patch !== b.patch) return a.patch < b.patch ? -1 : 1;
+  return 0;
+}
+
+/**
+ * A single comparator inside a range expression, e.g. ">=15.0.0".
+ * op is one of '<', '<=', '>', '>=', '='.
+ */
+function parseRangeComparator(token) {
+  const m = token.match(/^(<=|>=|<|>|=)(\d+\.\d+\.\d+)/);
+  if (!m) return null;
+  const op = m[1];
+  const version = parseNumericVersion(m[2]);
+  if (!version) return null;
+  return { op, version };
+}
+
+/**
+ * Parse a range expression consisting of one or more comparators separated
+ * by whitespace, e.g. ">=15.0.0 <15.0.5".
+ * Returns an array of comparators, or null if invalid.
+ */
+function parseRangeExpression(str) {
+  if (typeof str !== "string") return null;
+  const tokens = str
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+  if (tokens.length === 0) return null;
+
+  const comparators = [];
+  for (const token of tokens) {
+    const cmp = parseRangeComparator(token);
+    if (!cmp) return null;
+    comparators.push(cmp);
+  }
+  return comparators;
+}
+
+/**
+ * Check a single comparator (op, version) against an actual numeric version.
+ */
+function compareNumericWithComparator(actual, comparator) {
+  const cmp = compareNumericVersions(actual, comparator.version);
+  switch (comparator.op) {
+    case "<":
+      return cmp < 0;
+    case "<=":
+      return cmp <= 0;
+    case ">":
+      return cmp > 0;
+    case ">=":
+      return cmp >= 0;
+    case "=":
+      return cmp === 0;
+    default:
+      return false;
+  }
+}
+
+/**
+ * Match a numeric version against a wildcard pattern.
+ */
+function matchWildcard(numericVersion, pattern) {
+  if (!numericVersion || !pattern) return false;
+  if (pattern.major != null && numericVersion.major !== pattern.major) return false;
+  if (pattern.minor != null && numericVersion.minor !== pattern.minor) return false;
+  if (pattern.patch != null && numericVersion.patch !== pattern.patch) return false;
+  return true;
+}
+
+/**
  * Build a matcher function: (name, version) => boolean
  *  - noVersionCheck = true => match by name only
- *  - otherwise, check known vulnerable versions
+ *  - otherwise, check known vulnerable versions (exact, wildcard, ranges)
  */
 function buildMatcher(compromisedMap, noVersionCheck) {
+  // Cache compiled matchers per package name so we only parse expressions once.
+  const compiledPerPackage = new Map();
+
+  const compileVersionsSet = (versionsSet) => {
+    const exactVersions = new Set();
+    const wildcardPatterns = [];
+    const ranges = [];
+
+    for (const raw of versionsSet) {
+      if (typeof raw !== "string") continue;
+      const s = raw.trim();
+      if (!s) continue;
+
+      // Range expressions start with a comparator (<, <=, >, >=, =)
+      if (/^(<=|>=|<|>|=)/.test(s)) {
+        const range = parseRangeExpression(s);
+        if (range) {
+          ranges.push(range);
+          continue;
+        }
+      }
+
+      // Wildcard expressions contain 'x' or 'X'
+      if (/[xX]/.test(s)) {
+        const pattern = parseWildcardPattern(s);
+        if (pattern) {
+          wildcardPatterns.push(pattern);
+          continue;
+        }
+      }
+
+      // Fallback: treat as an exact version string
+      exactVersions.add(s);
+    }
+
+    return (version) => {
+      // Exact string match first
+      if (exactVersions.has(version)) return true;
+
+      const numeric = parseNumericVersion(version);
+
+      if (numeric) {
+        // Wildcards
+        for (const pattern of wildcardPatterns) {
+          if (matchWildcard(numeric, pattern)) return true;
+        }
+
+        // Range expressions: OR between expressions, AND inside each expression
+        for (const comparators of ranges) {
+          let ok = true;
+          for (const comparator of comparators) {
+            if (!compareNumericWithComparator(numeric, comparator)) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) return true;
+        }
+      }
+
+      return false;
+    };
+  };
+
   return (name, version) => {
     if (!name) return false;
     const versions = compromisedMap.get(name);
@@ -559,7 +749,13 @@ function buildMatcher(compromisedMap, noVersionCheck) {
       return true;
     }
 
-    return versions.has(version);
+    let compiled = compiledPerPackage.get(name);
+    if (!compiled) {
+      compiled = compileVersionsSet(versions);
+      compiledPerPackage.set(name, compiled);
+    }
+
+    return compiled(version);
   };
 }
 
@@ -1607,7 +1803,7 @@ async function main() {
   console.log(""); // clean separation
   if (findings.length === 0) {
     console.log(
-      "No Shai-Hulud compromised packages found in yarn.lock / package-lock.json / pnpm-lock.yaml / bun.lock in the organization."
+      "No vulnerable dependencies found in yarn.lock / package-lock.json / pnpm-lock.yaml / bun.lock in the scanned scope."
     );
     process.exit(0);
   }
