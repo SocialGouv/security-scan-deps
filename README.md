@@ -1,8 +1,9 @@
 # security-scan-deps
 
-Scan a GitHub organization (or a single repo, or a local directory) for dependencies that appear in one or more
-vulnerable package lists (for example the DataDog/Tenable Shai‑Hulud IOC list,
-CERT-FR advisories, or your own CSV/Markdown file).
+Scan a **GitHub organization**, a **GitLab instance/group**, a single repo, or a
+local directory for dependencies that appear in one or more vulnerable package
+lists (e.g. DataDog/Tenable Shai‑Hulud IOC list, CERT-FR advisories, SafeDep
+campaigns, or your own CSV/Markdown file).
 
 ## What it does
 
@@ -16,16 +17,22 @@ CERT-FR advisories, or your own CSV/Markdown file).
   - `package-lock.json` (npm v1–v3)
   - `pnpm-lock.yaml` (pnpm)
   - `bun.lock` (Bun)
+- Walks Git/GitLab trees recursively, so **monorepos are covered** wherever
+  lockfiles live in the project layout.
+- Discovery prioritizes the most recently active repos/projects first
+  (`pushed_at` for GitHub, `last_activity_at` for GitLab).
 - For each lockfile, checks dependency **name + version** against the vulnerable list
   (name-only if `--no-version-check` is enabled).
-- Prints any vulnerable packages, grouped per repo (GitHub mode) or per file (local mode).
+- Prints any vulnerable packages, grouped per repo (remote mode) or per file (local mode).
+  Lockfile **content never appears in stdout/stderr** — only the matches do.
 
 ## Requirements
 
 - Node.js **>= 18** (uses native `fetch`)
-- For GitHub mode:
-  - A GitHub token with **read** access on the org’s repositories, provided via the
-    `GITHUB_TOKEN` environment variable or `--token` CLI option.
+- For GitHub mode: a token with **read** access on the org’s repositories
+  (`GITHUB_TOKEN` env var, `--token-env VAR_NAME`, or `--token VALUE`).
+- For GitLab mode: a token with **read_api** scope on the GitLab instance
+  (`GITLAB_TOKEN` env var, `--token-env VAR_NAME`, or `--token VALUE`).
 
 ## Install
 
@@ -35,21 +42,19 @@ No installation step is required. Just run with Node.js **>= 18**.
 
 Main entrypoint: **`index.mjs`**, exposed as `yarn start`.
 
+The platform is selected with `--platform github|gitlab|local`. As a shortcut, a
+positional non-flag argument is treated as a GitHub org (e.g.
+`node index.mjs SocialGouv`), and `--local` is shorthand for
+`--platform local`.
+
 ### GitHub (organization / repo) mode
 
 ```bash
 # with GITHUB_TOKEN from the environment
 GITHUB_TOKEN=xxxx yarn start -- <org>
 
-# pure node
-GITHUB_TOKEN=xxxx node index.mjs <org>
-```
-
-Examples:
-
-```bash
-# scan org "SocialGouv" using Git trees (default, exhaustive)
-yarn start -- SocialGouv
+# explicit form
+yarn start -- --platform github <org>
 
 # scan a single repo inside the org (SocialGouv/my-repo)
 yarn start -- SocialGouv --repo my-repo
@@ -60,11 +65,8 @@ yarn start -- SocialGouv --discovery search
 # more conservative (ignore versions, match by name only)
 yarn start -- SocialGouv --no-version-check
 
-# add a small delay between GitHub API calls (in milliseconds)
-GITHUB_DELAY_MS=200 yarn start -- SocialGouv
-
-# or via CLI flag
-yarn start -- SocialGouv --github-delay-ms 200
+# throttle each API call by 200ms
+yarn start -- SocialGouv --delay-ms 200
 
 # override the remote compromised-packages URL
 yarn start -- SocialGouv --packages-url https://example.com/custom-list.csv
@@ -73,7 +75,32 @@ yarn start -- SocialGouv --packages-url https://example.com/custom-list.csv
 yarn start -- SocialGouv --packages-file ./compromised.csv
 ```
 
-### Local mode (no GitHub)
+### GitLab (instance / group / project) mode
+
+GitLab is a self-hosted service: you pass the **host** as the target.
+
+```bash
+# whole instance — all projects accessible to the token (membership=true)
+GITLAB_TOKEN=xxxx yarn start -- --platform gitlab gitlab.example.com
+
+# restrict to a group (subgroups included)
+yarn start -- --platform gitlab gitlab.example.com --group my-group
+
+# restrict to a single project (id or "namespace/path")
+yarn start -- --platform gitlab gitlab.example.com --project 42
+yarn start -- --platform gitlab gitlab.example.com --project ns/path
+
+# read the token from an arbitrary env var (instead of GITLAB_TOKEN)
+source .env && \
+  yarn start -- --platform gitlab gitlab.example.com \
+    --token-env MY_GITLAB_TOKEN_VAR
+
+# privacy-preserving run: suppress per-project progress logs and hash file paths
+yarn start -- --platform gitlab gitlab.example.com \
+  --findings-only --redact-paths
+```
+
+### Local mode (no remote)
 
 Scan the **current working directory** for lockfiles and check them against the compromised list:
 
@@ -96,16 +123,17 @@ node index.mjs --local --packages-file ./compromised.md
 Raw CLI usage (matches the script’s built‑in help):
 
 ```text
-Usage: node index.mjs <org> [--repo REPO] [--token TOKEN] [--no-version-check] [--packages-url URL] [--packages-file PATH] [--discovery MODE] [--github-delay-ms MS]
-   or: node index.mjs --local [--no-version-check] [--packages-url URL] [--packages-file PATH]
+node index.mjs [--platform github] <org>  [--repo REPO]    [common options]
+node index.mjs   --platform gitlab  <host> [--group GROUP | --project PROJECT] [common options]
+node index.mjs   --local                                                       [common options]
 ```
 
-Options:
+Common options:
 
-- `<org>` (required in GitHub mode): GitHub organization name
-- `--repo REPO`: limit the scan to a single repository within the org.
-  - You can pass either `owner/repo` or just `repo` (in which case `owner` is `<org>`).
-- `--token TOKEN`: GitHub token (if not using the `GITHUB_TOKEN` env var).
+- `--token VALUE` / `--token-env VAR_NAME` (or defaults: `GITHUB_TOKEN` /
+  `GITLAB_TOKEN`). `--token-env` is preferred when the secret lives in a
+  pre-existing variable: nothing is read by the tool from disk, and the value
+  never appears on the command line.
 - `--no-version-check`: match by package **name only** (more noisy, but conservative).
   When version checking is enabled (default), the tool supports:
   - exact versions: `1.2.3`
@@ -116,12 +144,28 @@ Options:
   - If you override this, **only that URL** is used (no DataDog+Tenable aggregation).
 - `--packages-file PATH`: load the compromised package list from a local file
   (Markdown or CSV). This bypasses remote fetching.
-- `--discovery MODE` (GitHub mode only):
+- `--redact-paths`: replace each file path in the findings output with
+  `sha256:<16-hex>` (the repo name is kept). Useful when the report is
+  reviewed in a context where source-tree layouts shouldn’t be exposed.
+- `--findings-only`: suppress per-repo / per-project progress lines on
+  stderr. The final discovered-lockfiles summary and the findings list are
+  still printed.
+- `--delay-ms MS` (aliases: `--github-delay-ms`, `--gitlab-delay-ms`,
+  also `GITHUB_DELAY_MS` env var): artificial throttle in milliseconds
+  before each API call. Helps when scanning very large orgs/instances.
+
+GitHub options:
+
+- `--repo REPO`: limit the scan to a single repository within the org
+  (`owner/repo` or just `repo`).
+- `--discovery MODE`:
   - `trees` (default): walk Git trees of all non‑archived repos (default branch).
   - `search`: use GitHub `/search/code` only.
-- `--github-delay-ms MS`: add an artificial delay (in milliseconds) before each
-  GitHub API call. You can also set `GITHUB_DELAY_MS` in the environment.
-  This helps reduce the chance of hitting GitHub’s rate limits on very large orgs.
+
+GitLab options:
+
+- `--group GROUP`: GitLab group id or full path. Subgroups are included.
+- `--project PROJECT`: GitLab project id or `namespace/project` path.
 
 ## Output
 

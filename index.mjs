@@ -16,10 +16,12 @@
 import { pathToFileURL } from "node:url";
 import fs from "node:fs/promises";
 import path from "node:path";
+import crypto from "node:crypto";
 
 const GITHUB_API_URL = "https://api.github.com";
+const GITLAB_API_PATH = "/api/v4";
 
-// Default per-request delay for GitHub API calls (in ms)
+// Default per-request delay for HTTP API calls (in ms)
 const DEFAULT_GITHUB_DELAY_MS = 0;
 
 // Maximum wait time when rate-limited, in milliseconds (safety cap)
@@ -36,92 +38,194 @@ const TENABLE_MARKDOWN_URL =
 /**
  * CLI args parsing.
  *
- * Remote mode (GitHub, default):
- *   node index.mjs <org> [--repo REPO] [--token TOKEN] [--no-version-check]
- *                      [--packages-url URL] [--packages-file PATH]
- *                      [--discovery MODE]
+ * Usage:
+ *   node index.mjs [--platform PLATFORM] <target> [options]
  *
- * Local mode (scan current directory, no GitHub):
- *   node index.mjs --local [--no-version-check]
- *                           [--packages-url URL] [--packages-file PATH]
+ *   PLATFORM = github (default if <target> is a non-flag string)
+ *            | gitlab
+ *            | local  (also: --local shorthand)
+ *
+ *   <target> = GitHub org name (platform=github)
+ *            | GitLab host like "gitlab.example.com" (platform=gitlab)
+ *            | (omitted for local)
+ *
+ * Auth (GitHub / GitLab): one of --token VALUE, --token-env VAR_NAME,
+ * or the default env var (GITHUB_TOKEN / GITLAB_TOKEN).
+ *
+ * Common options:
+ *   --no-version-check        Match by package name only.
+ *   --packages-url URL        Override remote IOC list URL.
+ *   --packages-file PATH      Use a local IOC list file (md/csv).
+ *   --redact-paths            SHA-256 each lockfile path in the findings output.
+ *   --findings-only           Suppress per-repo progress logs (stderr).
+ *   --delay-ms MS             Throttle each API call by MS milliseconds.
+ *                             (Aliases: --github-delay-ms, --gitlab-delay-ms.)
+ *
+ * GitHub options:
+ *   --repo REPO               Restrict to one repo (`owner/repo` or `repo`).
+ *   --discovery MODE          trees (default) | search
+ *
+ * GitLab options:
+ *   --group GROUP             Restrict to a GitLab group id or path (subgroups included).
+ *   --project PROJECT         Restrict to a single project (numeric id or namespace/project).
  */
 function parseArgs() {
   const argv = process.argv.slice(2);
 
   const usage =
-    "Usage: node index.mjs <org> [--repo REPO] [--token TOKEN] [--no-version-check] [--packages-url URL] [--packages-file PATH] [--discovery MODE] [--github-delay-ms MS]\n" +
-    "   or: node index.mjs --local [--no-version-check] [--packages-url URL] [--packages-file PATH]";
+    "Usage:\n" +
+    "  node index.mjs [--platform github] <org> [--repo REPO] [--token TOKEN | --token-env VAR] [--discovery MODE] [common options]\n" +
+    "  node index.mjs   --platform gitlab  <host> [--group GROUP | --project PROJECT] [--token TOKEN | --token-env VAR] [common options]\n" +
+    "  node index.mjs   --local [common options]\n" +
+    "\n" +
+    "Common options: --no-version-check, --packages-url URL, --packages-file PATH,\n" +
+    "                --redact-paths, --findings-only, --delay-ms MS";
 
   if (argv.length === 0) {
     console.error(usage);
     process.exit(1);
   }
 
-  let mode = "remote"; // "remote" (GitHub) or "local" (current directory)
-  let org = null;
-  let repo = null;
-  let token = process.env.GITHUB_TOKEN || null;
+  let platform = null;
+  let target = null;
+  let repo = null; // GitHub repo
+  let project = null; // GitLab project
+  let group = null; // GitLab group
+  let token = null;
+  let tokenEnv = null;
   let noVersionCheck = false;
   let packagesUrl = DEFAULT_PACKAGE_LIST_URL;
   let packagesFile = null;
-  let discoveryMode = "trees"; // "trees" (default) or "search"
-  let githubDelayMs = Number.parseInt(process.env.GITHUB_DELAY_MS || "", 10);
-  if (!Number.isFinite(githubDelayMs) || githubDelayMs < 0) {
-    githubDelayMs = DEFAULT_GITHUB_DELAY_MS;
+  let discoveryMode = "trees";
+  let redactPaths = false;
+  let findingsOnly = false;
+  let httpDelayMs = Number.parseInt(process.env.GITHUB_DELAY_MS || "", 10);
+  if (!Number.isFinite(httpDelayMs) || httpDelayMs < 0) {
+    httpDelayMs = DEFAULT_GITHUB_DELAY_MS;
   }
 
-  let i = 0;
-  if (argv[0] === "--local") {
-    mode = "local";
-    i = 1;
-  } else {
-    if (argv[0].startsWith("-")) {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    const next = argv[i + 1];
+    if (arg === "--help" || arg === "-h") {
+      console.log(usage);
+      process.exit(0);
+    } else if (arg === "--local") {
+      platform = "local";
+    } else if (arg === "--platform" && next) {
+      platform = argv[++i];
+    } else if (arg === "--repo" && next) {
+      repo = argv[++i];
+    } else if (arg === "--project" && next) {
+      project = argv[++i];
+    } else if (arg === "--group" && next) {
+      group = argv[++i];
+    } else if (arg === "--token" && next) {
+      token = argv[++i];
+    } else if (arg === "--token-env" && next) {
+      tokenEnv = argv[++i];
+    } else if (arg === "--no-version-check") {
+      noVersionCheck = true;
+    } else if (arg === "--packages-url" && next) {
+      packagesUrl = argv[++i];
+    } else if (arg === "--packages-file" && next) {
+      packagesFile = argv[++i];
+    } else if (arg === "--discovery" && next) {
+      discoveryMode = argv[++i];
+    } else if (arg === "--redact-paths") {
+      redactPaths = true;
+    } else if (arg === "--findings-only") {
+      findingsOnly = true;
+    } else if (
+      (arg === "--delay-ms" ||
+        arg === "--github-delay-ms" ||
+        arg === "--gitlab-delay-ms") &&
+      next
+    ) {
+      const val = Number.parseInt(argv[++i], 10);
+      if (Number.isFinite(val) && val >= 0) {
+        httpDelayMs = val;
+      }
+    } else if (!arg.startsWith("-")) {
+      if (target === null) {
+        target = arg;
+      } else {
+        console.error(`Unexpected positional argument: ${arg}`);
+        console.error(usage);
+        process.exit(1);
+      }
+    } else {
+      console.error(`Unknown option: ${arg}`);
       console.error(usage);
       process.exit(1);
     }
-    org = argv[0];
-    i = 1;
   }
 
-  for (; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === "--no-version-check") {
-      noVersionCheck = true;
-    } else if (arg === "--packages-url" && argv[i + 1]) {
-      packagesUrl = argv[++i];
-    } else if (arg === "--packages-file" && argv[i + 1]) {
-      packagesFile = argv[++i];
-    } else if (mode === "remote" && arg === "--token" && argv[i + 1]) {
-      token = argv[++i];
-    } else if (mode === "remote" && arg === "--repo" && argv[i + 1]) {
-      repo = argv[++i];
-    } else if (mode === "remote" && arg === "--discovery" && argv[i + 1]) {
-      discoveryMode = argv[++i];
-    } else if (arg === "--github-delay-ms" && argv[i + 1]) {
-      const val = Number.parseInt(argv[++i], 10);
-      if (Number.isFinite(val) && val >= 0) {
-        githubDelayMs = val;
-      }
+  // Infer platform from target if not explicitly set.
+  if (!platform) {
+    if (target) {
+      platform = "github";
+    } else {
+      console.error(usage);
+      process.exit(1);
     }
   }
 
-  if (mode === "remote" && !token) {
-    console.error(
-      "Error: no GitHub token provided. Use --token or the GITHUB_TOKEN environment variable."
-    );
+  // Validate platform value.
+  if (
+    platform !== "github" &&
+    platform !== "gitlab" &&
+    platform !== "local"
+  ) {
+    console.error(`Unknown platform "${platform}". Expected github | gitlab | local.`);
     process.exit(1);
   }
 
+  // Resolve token from --token, --token-env, or default env var.
+  if (platform !== "local") {
+    if (!token) {
+      if (tokenEnv) {
+        token = process.env[tokenEnv] || null;
+        if (!token) {
+          console.error(
+            `Error: environment variable "${tokenEnv}" is unset or empty (referenced by --token-env).`
+          );
+          process.exit(1);
+        }
+      } else {
+        const defaultVar =
+          platform === "github" ? "GITHUB_TOKEN" : "GITLAB_TOKEN";
+        token = process.env[defaultVar] || null;
+        if (!token) {
+          console.error(
+            `Error: no ${platform} token provided. Use --token, --token-env, or set ${defaultVar}.`
+          );
+          process.exit(1);
+        }
+      }
+    }
+    if (!target) {
+      console.error(
+        `Error: missing target for platform "${platform}" (org or host).`
+      );
+      process.exit(1);
+    }
+  }
+
   return {
-    mode,
-    org,
+    platform,
+    target,
     repo,
+    project,
+    group,
     token,
     noVersionCheck,
     packagesUrl,
     packagesFile,
     discoveryMode,
-    githubDelayMs,
+    httpDelayMs,
+    redactPaths,
+    findingsOnly,
   };
 }
 
@@ -763,6 +867,11 @@ function buildMatcher(compromisedMap, noVersionCheck) {
 export const _testInternals = {
   mergeCompromisedMaps,
   buildMatcher,
+  loadCompromisedPackages,
+  parseGitlabLinkHeader,
+  sha256Short: (text) =>
+    "sha256:" +
+    crypto.createHash("sha256").update(text).digest("hex").slice(0, 16),
 };
 
 /**
@@ -974,6 +1083,8 @@ async function listOrgRepos(org, githubClient) {
       per_page: String(perPage),
       page: String(page),
       type: "all",
+      sort: "pushed",
+      direction: "desc",
     });
 
     const url = `${GITHUB_API_URL}/orgs/${org}/repos?${params.toString()}`;
@@ -1029,21 +1140,27 @@ async function listLockFilesViaTreesForRepos(
 ) {
   const { fetch: githubFetch } = githubClient;
 
+  const sortedRepos = [...repos].sort((a, b) => {
+    const ta = a && a.pushed_at ? Date.parse(a.pushed_at) : 0;
+    const tb = b && b.pushed_at ? Date.parse(b.pushed_at) : 0;
+    return tb - ta;
+  });
+
   console.error(
-    `Discovering lockfiles via Git trees across ${repos.length} repos...`
+    `Discovering lockfiles via Git trees across ${sortedRepos.length} repos (most recently pushed first)...`
   );
   const yarn = [];
   const npm = [];
   const pnpm = [];
   const bun = [];
 
-  for (let index = 0; index < repos.length; index++) {
-    const repo = repos[index];
+  for (let index = 0; index < sortedRepos.length; index++) {
+    const repo = sortedRepos[index];
     const repoFullName = repo.full_name;
 
     if (repo.archived && !includeArchived) {
       console.error(
-        `[${index + 1}/${repos.length}] Archived repo, skipping: ${repoFullName}`
+        `[${index + 1}/${sortedRepos.length}] Archived repo, skipping: ${repoFullName}`
       );
       continue;
     }
@@ -1051,7 +1168,7 @@ async function listLockFilesViaTreesForRepos(
     const defaultBranch = repo.default_branch || "main";
 
     console.error(
-      `[${index + 1}/${repos.length}] Scanning Git tree of ${repoFullName}@${defaultBranch}...`
+      `[${index + 1}/${sortedRepos.length}] Scanning Git tree of ${repoFullName}@${defaultBranch}...`
     );
 
     try {
@@ -1068,7 +1185,7 @@ async function listLockFilesViaTreesForRepos(
           body.toLowerCase().includes("git repository is empty")
         ) {
           console.error(
-            `[${index + 1}/${repos.length}] Empty repo, skipping: ${repoFullName}@${defaultBranch}`
+            `[${index + 1}/${sortedRepos.length}] Empty repo, skipping: ${repoFullName}@${defaultBranch}`
           );
         } else {
           console.error(
@@ -1523,6 +1640,252 @@ export function checkBunLock(content, isCompromised) {
   return Array.from(matchesMap.values());
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * GitLab API client
+ *
+ * Mirrors the GitHub helpers above (buildGithubHeaders / makeGithubClient /
+ * listOrgRepos / listLockFilesViaTreesForRepos / fetchFileContent) but talks
+ * to a GitLab instance over /api/v4. The lockfile parsers and matcher are
+ * platform-agnostic and reused as-is.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+function buildGitlabHeaders(token) {
+  return {
+    "User-Agent": "shai-hulud-org-scanner",
+    "PRIVATE-TOKEN": token,
+    Accept: "application/json",
+  };
+}
+
+function makeGitlabClient({
+  host,
+  headers,
+  delayMs = DEFAULT_GITHUB_DELAY_MS,
+  maxRetries = 3,
+} = {}) {
+  const baseHeaders = headers || {};
+  const baseUrl = `https://${host}${GITLAB_API_PATH}`;
+
+  const gitlabFetch = async (url, options = {}) => {
+    const { method = "GET", body, headers: extraHeaders, accept } = options;
+    const finalHeaders = { ...baseHeaders, ...extraHeaders };
+    if (accept) finalHeaders.Accept = accept;
+
+    let attempt = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (delayMs && delayMs > 0) await sleep(delayMs);
+
+      const res = await fetch(url, { method, headers: finalHeaders, body });
+
+      if (res.status !== 429) return res;
+
+      const retryAfterRaw = res.headers.get("retry-after");
+      let waitMs = retryAfterRaw
+        ? Number.parseInt(retryAfterRaw, 10) * 1000
+        : 1000;
+      if (!Number.isFinite(waitMs) || waitMs < 1000) waitMs = 1000;
+      if (waitMs > MAX_RATE_LIMIT_WAIT_MS) waitMs = MAX_RATE_LIMIT_WAIT_MS;
+
+      attempt += 1;
+      if (attempt > maxRetries) {
+        console.error(
+          `GitLab rate limit reached, giving up after ${maxRetries} retries.`
+        );
+        return res;
+      }
+      console.error(
+        `GitLab rate limit reached (attempt ${attempt}/${maxRetries}). Waiting ${Math.round(
+          waitMs / 1000
+        )}s before retrying...`
+      );
+      await sleep(waitMs);
+    }
+  };
+
+  return { fetch: gitlabFetch, baseUrl };
+}
+
+function parseGitlabLinkHeader(linkHeader) {
+  if (!linkHeader) return {};
+  const result = {};
+  for (const part of linkHeader.split(",")) {
+    const m = part.trim().match(/^<([^>]+)>;\s*rel="([^"]+)"/);
+    if (m) result[m[2]] = m[1];
+  }
+  return result;
+}
+
+async function listGitlabProjects(
+  gitlabClient,
+  { group, findingsOnly = false } = {}
+) {
+  const subpath = group
+    ? `/groups/${encodeURIComponent(group)}/projects`
+    : `/projects`;
+  const params = new URLSearchParams({
+    per_page: "100",
+    order_by: "last_activity_at",
+    sort: "desc",
+    archived: "false",
+  });
+  if (group) params.set("include_subgroups", "true");
+  else params.set("membership", "true");
+
+  let url = `${gitlabClient.baseUrl}${subpath}?${params.toString()}`;
+  const projects = [];
+  let page = 0;
+  if (!findingsOnly) {
+    console.error(
+      group
+        ? `Listing GitLab projects in group "${group}" (with subgroups)...`
+        : `Listing GitLab projects accessible to the token...`
+    );
+  }
+
+  while (url) {
+    page += 1;
+    const res = await gitlabClient.fetch(url);
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(
+        `GitLab projects list failed (${res.status} ${res.statusText}): ${body.slice(
+          0,
+          200
+        )}`
+      );
+    }
+    const batch = await res.json();
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    projects.push(...batch);
+    const link = parseGitlabLinkHeader(res.headers.get("link"));
+    url = link.next || null;
+  }
+
+  if (!findingsOnly) {
+    console.error(`  -> Retrieved ${projects.length} GitLab projects.`);
+  }
+  return projects;
+}
+
+async function fetchSingleGitlabProject(projectRef, gitlabClient) {
+  const url = `${gitlabClient.baseUrl}/projects/${encodeURIComponent(projectRef)}`;
+  const res = await gitlabClient.fetch(url);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(
+      `Failed to fetch GitLab project "${projectRef}": ${res.status} ${res.statusText}: ${body.slice(0, 200)}`
+    );
+  }
+  return res.json();
+}
+
+async function listLockFilesViaGitlabTrees(
+  projects,
+  gitlabClient,
+  { findingsOnly = false } = {}
+) {
+  const yarn = [];
+  const npm = [];
+  const pnpm = [];
+  const bun = [];
+
+  if (!findingsOnly) {
+    console.error(
+      `Discovering lockfiles via GitLab trees across ${projects.length} projects (most recent activity first)...`
+    );
+  }
+
+  for (let index = 0; index < projects.length; index++) {
+    const project = projects[index];
+    const id = project.id;
+    const ref = project.default_branch;
+    const label = project.path_with_namespace || `project-${id}`;
+
+    if (project.archived) {
+      if (!findingsOnly) {
+        console.error(
+          `[${index + 1}/${projects.length}] Archived project, skipping: ${label}`
+        );
+      }
+      continue;
+    }
+    if (!ref) {
+      if (!findingsOnly) {
+        console.error(
+          `[${index + 1}/${projects.length}] No default branch, skipping: ${label}`
+        );
+      }
+      continue;
+    }
+
+    if (!findingsOnly) {
+      console.error(
+        `[${index + 1}/${projects.length}] Scanning GitLab tree of ${label}@${ref}...`
+      );
+    }
+
+    try {
+      let url =
+        `${gitlabClient.baseUrl}/projects/${id}/repository/tree` +
+        `?recursive=true&per_page=100&ref=${encodeURIComponent(ref)}`;
+      while (url) {
+        const res = await gitlabClient.fetch(url);
+        if (!res.ok) {
+          if (res.status === 404) break; // empty repo / no tree on default branch
+          if (!findingsOnly) {
+            const body = await res.text();
+            console.error(
+              `  Tree fetch failed for ${label}: ${res.status} ${res.statusText}: ${body.slice(0, 200)}`
+            );
+          }
+          break;
+        }
+        const items = await res.json();
+        if (!Array.isArray(items)) break;
+        for (const item of items) {
+          if (item.type !== "blob") continue;
+          const p = item.path || "";
+          const entry = {
+            project: { id, label, ref },
+            path: p,
+          };
+          if (p.endsWith("yarn.lock")) yarn.push(entry);
+          else if (p.endsWith("package-lock.json")) npm.push(entry);
+          else if (p.endsWith("pnpm-lock.yaml")) pnpm.push(entry);
+          else if (p.endsWith("bun.lock")) bun.push(entry);
+        }
+        const link = parseGitlabLinkHeader(res.headers.get("link"));
+        url = link.next || null;
+      }
+    } catch (e) {
+      if (!findingsOnly) {
+        console.error(
+          `  Error enumerating tree for ${label}: ${e.message}`
+        );
+      }
+    }
+  }
+
+  return { yarn, npm, pnpm, bun };
+}
+
+async function fetchGitlabFileContent({ project, path: filePath }, gitlabClient) {
+  const encoded = encodeURIComponent(filePath);
+  const url =
+    `${gitlabClient.baseUrl}/projects/${project.id}/repository/files/${encoded}/raw` +
+    `?ref=${encodeURIComponent(project.ref)}`;
+  const res = await gitlabClient.fetch(url, { accept: "text/plain" });
+  if (!res.ok) {
+    if (res.status === 404) return null;
+    const body = await res.text();
+    throw new Error(
+      `Failed to fetch ${filePath} from ${project.label}: ${res.status} ${res.statusText}: ${body.slice(0, 200)}`
+    );
+  }
+  return res.text();
+}
+
 /**
  * Main program.
  */
@@ -1531,287 +1894,26 @@ function getRepoFullName(org, repoOption) {
   return repoOption.includes("/") ? repoOption : `${org}/${repoOption}`;
 }
 
-async function main() {
-  const {
-    mode,
-    org,
-    repo,
-    token,
-    noVersionCheck,
-    packagesUrl,
-    packagesFile,
-    discoveryMode,
-    githubDelayMs,
-  } = parseArgs();
+function sha256Short(text) {
+  return (
+    "sha256:" +
+    crypto.createHash("sha256").update(text).digest("hex").slice(0, 16)
+  );
+}
 
-  // 1) Load compromised package list
-  const compromisedMap = await loadCompromisedPackages({
-    packagesUrl,
-    packagesFile,
-  });
-  const isCompromised = buildMatcher(compromisedMap, noVersionCheck);
-
-  let findings = [];
-
-  if (mode === "local") {
-    const rootDir = process.cwd();
-    findings = await scanLocalDirectory(rootDir, isCompromised);
-  } else {
-    const headers = buildGithubHeaders(token);
-    const githubClient = makeGithubClient({ headers, delayMs: githubDelayMs });
-    const repoFullName = getRepoFullName(org, repo);
-
-    const scopeLabel = repoFullName
-      ? `repository "${repoFullName}"`
-      : `organization "${org}"`;
-
-    // 2) Discover lockfiles in the org or a specific repo
-    console.error(`\nScanning GitHub ${scopeLabel} for lockfiles...\n`);
-
-    let yarnItems = [];
-    let pkgLockItems = [];
-    let pnpmItems = [];
-    let bunItems = [];
-
-    if (discoveryMode === "search") {
-      console.error("Discovery mode: GitHub /search/code only.");
-      if (repoFullName) {
-        console.error(`Restricting search to repo ${repoFullName}.`);
-        yarnItems = await searchRepoLockFiles(
-          repoFullName,
-          "yarn.lock",
-          githubClient
-        );
-        pkgLockItems = await searchRepoLockFiles(
-          repoFullName,
-          "package-lock.json",
-          githubClient
-        );
-        pnpmItems = await searchRepoLockFiles(
-          repoFullName,
-          "pnpm-lock.yaml",
-          githubClient
-        );
-        bunItems = await searchRepoLockFiles(
-          repoFullName,
-          "bun.lock",
-          githubClient
-        );
-      } else {
-        yarnItems = await searchLockFiles(org, "yarn.lock", githubClient);
-        pkgLockItems = await searchLockFiles(org, "package-lock.json", githubClient);
-        pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", githubClient);
-        bunItems = await searchLockFiles(org, "bun.lock", githubClient);
-      }
-    } else {
-      console.error(
-        "Discovery mode: Git trees for all repos (default, more exhaustive)."
-      );
-      try {
-        let result;
-        if (repoFullName) {
-          console.error(`Restricting tree discovery to repo ${repoFullName}.`);
-          result = await listLockFilesViaTreesForRepoFullName(
-            repoFullName,
-            githubClient
-          );
-        } else {
-          result = await listLockFilesViaTrees(org, githubClient);
-        }
-
-        const { yarn, npm, pnpm, bun } = result;
-        yarnItems = yarn;
-        pkgLockItems = npm;
-        pnpmItems = pnpm;
-        bunItems = bun;
-      } catch (e) {
-        console.error(
-          `Error while enumerating lockfiles via Git trees: ${e.message}`
-        );
-        console.error(
-          repoFullName
-            ? `Falling back to GitHub /search/code for repo ${repoFullName}...`
-            : "Falling back to GitHub /search/code for the whole org..."
-        );
-
-        if (repoFullName) {
-          yarnItems = await searchRepoLockFiles(
-            repoFullName,
-            "yarn.lock",
-            githubClient
-          );
-          pkgLockItems = await searchRepoLockFiles(
-            repoFullName,
-            "package-lock.json",
-            githubClient
-          );
-          pnpmItems = await searchRepoLockFiles(
-            repoFullName,
-            "pnpm-lock.yaml",
-            githubClient
-          );
-          bunItems = await searchRepoLockFiles(
-            repoFullName,
-            "bun.lock",
-            githubClient
-          );
-        } else {
-          yarnItems = await searchLockFiles(org, "yarn.lock", githubClient);
-          pkgLockItems = await searchLockFiles(
-            org,
-            "package-lock.json",
-            githubClient
-          );
-          pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", githubClient);
-          bunItems = await searchLockFiles(org, "bun.lock", githubClient);
-        }
-      }
-    }
-
-    console.error("Lockfiles discovered:");
-    console.error(`  yarn.lock         : ${yarnItems.length}`);
-    console.error(`  package-lock.json : ${pkgLockItems.length}`);
-    console.error(`  pnpm-lock.yaml    : ${pnpmItems.length}`);
-    console.error(`  bun.lock          : ${bunItems.length}\n`);
-
-    // 3) Scan yarn.lock
-    for (const item of yarnItems) {
-      const repoFullNameForItem = item.repository.full_name;
-      const lockPath = item.path;
-
-      let content;
-      try {
-        content = await fetchFileContent(
-          repoFullNameForItem,
-          lockPath,
-          githubClient
-        );
-      } catch (e) {
-        console.error(
-          `Error fetching ${repoFullNameForItem}/${lockPath}: ${e.message}`
-        );
-        continue;
-      }
-      if (!content) continue;
-
-      const matches = checkYarnLock(content, isCompromised);
-      if (matches.length > 0) {
-        findings.push({
-          repo: repoFullNameForItem,
-          path: lockPath,
-          type: "yarn.lock",
-          matches,
-        });
-      }
-    }
-
-    // 4) Scan package-lock.json
-    for (const item of pkgLockItems) {
-      const repoFullNameForItem = item.repository.full_name;
-      const lockPath = item.path;
-
-      let content;
-      try {
-        content = await fetchFileContent(
-          repoFullNameForItem,
-          lockPath,
-          githubClient
-        );
-      } catch (e) {
-        console.error(
-          `Error fetching ${repoFullNameForItem}/${lockPath}: ${e.message}`
-        );
-        continue;
-      }
-      if (!content) continue;
-
-      const matches = checkPackageLock(content, isCompromised);
-      if (matches.length > 0) {
-        findings.push({
-          repo: repoFullNameForItem,
-          path: lockPath,
-          type: "package-lock.json",
-          matches,
-        });
-      }
-    }
-
-    // 5) Scan pnpm-lock.yaml
-    for (const item of pnpmItems) {
-      const repoFullNameForItem = item.repository.full_name;
-      const lockPath = item.path;
-
-      let content;
-      try {
-        content = await fetchFileContent(
-          repoFullNameForItem,
-          lockPath,
-          githubClient
-        );
-      } catch (e) {
-        console.error(
-          `Error fetching ${repoFullNameForItem}/${lockPath}: ${e.message}`
-        );
-        continue;
-      }
-      if (!content) continue;
-
-      const matches = checkPnpmLock(content, isCompromised);
-      if (matches.length > 0) {
-        findings.push({
-          repo: repoFullNameForItem,
-          path: lockPath,
-          type: "pnpm-lock.yaml",
-          matches,
-        });
-      }
-    }
-
-    // 6) Scan bun.lock
-    for (const item of bunItems) {
-      const repoFullNameForItem = item.repository.full_name;
-      const lockPath = item.path;
-
-      let content;
-      try {
-        content = await fetchFileContent(
-          repoFullNameForItem,
-          lockPath,
-          githubClient
-        );
-      } catch (e) {
-        console.error(
-          `Error fetching ${repoFullNameForItem}/${lockPath}: ${e.message}`
-        );
-        continue;
-      }
-      if (!content) continue;
-
-      const matches = checkBunLock(content, isCompromised);
-      if (matches.length > 0) {
-        findings.push({
-          repo: repoFullNameForItem,
-          path: lockPath,
-          type: "bun.lock",
-          matches,
-        });
-      }
-    }
-  }
-
-  // 7) Print results
-  console.log(""); // clean separation
+function printFindings(findings, { redactPaths = false } = {}) {
+  console.log("");
   if (findings.length === 0) {
     console.log(
       "No vulnerable dependencies found in yarn.lock / package-lock.json / pnpm-lock.yaml / bun.lock in the scanned scope."
     );
     process.exit(0);
   }
-
   console.log("Compromised packages detected:");
   console.log("==============================");
   for (const f of findings) {
-    console.log(`- ${f.repo} :: ${f.path} (${f.type})`);
+    const shownPath = redactPaths ? sha256Short(f.path) : f.path;
+    console.log(`- ${f.repo} :: ${shownPath} (${f.type})`);
     for (const { name, version } of f.matches) {
       if (version) {
         console.log(`    • ${name}@${version}`);
@@ -1823,7 +1925,240 @@ async function main() {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+async function scanGithubPlatform(args, isCompromised) {
+  const {
+    target: org,
+    repo,
+    token,
+    discoveryMode,
+    httpDelayMs,
+    findingsOnly,
+  } = args;
+
+  const headers = buildGithubHeaders(token);
+  const githubClient = makeGithubClient({ headers, delayMs: httpDelayMs });
+  const repoFullName = getRepoFullName(org, repo);
+
+  const scopeLabel = repoFullName
+    ? `repository "${repoFullName}"`
+    : `organization "${org}"`;
+
+  if (!findingsOnly) {
+    console.error(`\nScanning GitHub ${scopeLabel} for lockfiles...\n`);
+  }
+
+  let yarnItems = [];
+  let pkgLockItems = [];
+  let pnpmItems = [];
+  let bunItems = [];
+
+  if (discoveryMode === "search") {
+    if (!findingsOnly) {
+      console.error("Discovery mode: GitHub /search/code only.");
+    }
+    if (repoFullName) {
+      yarnItems = await searchRepoLockFiles(repoFullName, "yarn.lock", githubClient);
+      pkgLockItems = await searchRepoLockFiles(repoFullName, "package-lock.json", githubClient);
+      pnpmItems = await searchRepoLockFiles(repoFullName, "pnpm-lock.yaml", githubClient);
+      bunItems = await searchRepoLockFiles(repoFullName, "bun.lock", githubClient);
+    } else {
+      yarnItems = await searchLockFiles(org, "yarn.lock", githubClient);
+      pkgLockItems = await searchLockFiles(org, "package-lock.json", githubClient);
+      pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", githubClient);
+      bunItems = await searchLockFiles(org, "bun.lock", githubClient);
+    }
+  } else {
+    if (!findingsOnly) {
+      console.error(
+        "Discovery mode: Git trees for all repos (default, more exhaustive)."
+      );
+    }
+    try {
+      let result;
+      if (repoFullName) {
+        result = await listLockFilesViaTreesForRepoFullName(
+          repoFullName,
+          githubClient
+        );
+      } else {
+        result = await listLockFilesViaTrees(org, githubClient);
+      }
+      yarnItems = result.yarn;
+      pkgLockItems = result.npm;
+      pnpmItems = result.pnpm;
+      bunItems = result.bun;
+    } catch (e) {
+      if (!findingsOnly) {
+        console.error(
+          `Error while enumerating lockfiles via Git trees: ${e.message}`
+        );
+        console.error(
+          repoFullName
+            ? `Falling back to GitHub /search/code for repo ${repoFullName}...`
+            : "Falling back to GitHub /search/code for the whole org..."
+        );
+      }
+      if (repoFullName) {
+        yarnItems = await searchRepoLockFiles(repoFullName, "yarn.lock", githubClient);
+        pkgLockItems = await searchRepoLockFiles(repoFullName, "package-lock.json", githubClient);
+        pnpmItems = await searchRepoLockFiles(repoFullName, "pnpm-lock.yaml", githubClient);
+        bunItems = await searchRepoLockFiles(repoFullName, "bun.lock", githubClient);
+      } else {
+        yarnItems = await searchLockFiles(org, "yarn.lock", githubClient);
+        pkgLockItems = await searchLockFiles(org, "package-lock.json", githubClient);
+        pnpmItems = await searchLockFiles(org, "pnpm-lock.yaml", githubClient);
+        bunItems = await searchLockFiles(org, "bun.lock", githubClient);
+      }
+    }
+  }
+
+  console.error("Lockfiles discovered:");
+  console.error(`  yarn.lock         : ${yarnItems.length}`);
+  console.error(`  package-lock.json : ${pkgLockItems.length}`);
+  console.error(`  pnpm-lock.yaml    : ${pnpmItems.length}`);
+  console.error(`  bun.lock          : ${bunItems.length}\n`);
+
+  return scanLockfileBatch(
+    [
+      { items: yarnItems, type: "yarn.lock", check: checkYarnLock },
+      { items: pkgLockItems, type: "package-lock.json", check: checkPackageLock },
+      { items: pnpmItems, type: "pnpm-lock.yaml", check: checkPnpmLock },
+      { items: bunItems, type: "bun.lock", check: checkBunLock },
+    ],
+    isCompromised,
+    {
+      fetchContent: (item) =>
+        fetchFileContent(item.repository.full_name, item.path, githubClient),
+      labelFor: (item) => item.repository.full_name,
+      findingsOnly,
+    }
+  );
+}
+
+async function scanGitlabPlatform(args, isCompromised) {
+  const {
+    target: host,
+    project,
+    group,
+    token,
+    httpDelayMs,
+    findingsOnly,
+  } = args;
+
+  const headers = buildGitlabHeaders(token);
+  const gitlabClient = makeGitlabClient({
+    host,
+    headers,
+    delayMs: httpDelayMs,
+  });
+
+  const scopeLabel = project
+    ? `project "${project}"`
+    : group
+    ? `group "${group}"`
+    : `instance "${host}"`;
+
+  if (!findingsOnly) {
+    console.error(`\nScanning GitLab ${scopeLabel} for lockfiles...\n`);
+  }
+
+  let projects;
+  if (project) {
+    projects = [await fetchSingleGitlabProject(project, gitlabClient)];
+  } else {
+    projects = await listGitlabProjects(gitlabClient, { group, findingsOnly });
+  }
+
+  const { yarn, npm, pnpm, bun } = await listLockFilesViaGitlabTrees(
+    projects,
+    gitlabClient,
+    { findingsOnly }
+  );
+
+  console.error("Lockfiles discovered:");
+  console.error(`  yarn.lock         : ${yarn.length}`);
+  console.error(`  package-lock.json : ${npm.length}`);
+  console.error(`  pnpm-lock.yaml    : ${pnpm.length}`);
+  console.error(`  bun.lock          : ${bun.length}\n`);
+
+  return scanLockfileBatch(
+    [
+      { items: yarn, type: "yarn.lock", check: checkYarnLock },
+      { items: npm, type: "package-lock.json", check: checkPackageLock },
+      { items: pnpm, type: "pnpm-lock.yaml", check: checkPnpmLock },
+      { items: bun, type: "bun.lock", check: checkBunLock },
+    ],
+    isCompromised,
+    {
+      fetchContent: (item) => fetchGitlabFileContent(item, gitlabClient),
+      labelFor: (item) => item.project.label,
+      findingsOnly,
+    }
+  );
+}
+
+async function scanLockfileBatch(
+  groups,
+  isCompromised,
+  { fetchContent, labelFor, findingsOnly = false }
+) {
+  const findings = [];
+  for (const { items, type, check } of groups) {
+    for (const item of items) {
+      let content;
+      try {
+        content = await fetchContent(item);
+      } catch (e) {
+        if (!findingsOnly) {
+          console.error(
+            `Error fetching ${labelFor(item)}/${item.path}: ${e.message}`
+          );
+        }
+        continue;
+      }
+      if (!content) continue;
+      const matches = check(content, isCompromised);
+      if (matches.length > 0) {
+        findings.push({
+          repo: labelFor(item),
+          path: item.path,
+          type,
+          matches,
+        });
+      }
+    }
+  }
+  return findings;
+}
+
+async function main() {
+  const args = parseArgs();
+  const compromisedMap = await loadCompromisedPackages({
+    packagesUrl: args.packagesUrl,
+    packagesFile: args.packagesFile,
+  });
+  const isCompromised = buildMatcher(compromisedMap, args.noVersionCheck);
+
+  let findings = [];
+
+  if (args.platform === "local") {
+    findings = await scanLocalDirectory(process.cwd(), isCompromised);
+  } else if (args.platform === "github") {
+    findings = await scanGithubPlatform(args, isCompromised);
+  } else if (args.platform === "gitlab") {
+    findings = await scanGitlabPlatform(args, isCompromised);
+  } else {
+    console.error(`Unknown platform: ${args.platform}`);
+    process.exit(1);
+  }
+
+  printFindings(findings, { redactPaths: args.redactPaths });
+}
+
+if (
+  typeof process.argv[1] === "string" &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
   // Only run the CLI when this file is the main entrypoint
   // (not when imported from tests or other modules).
   main();
