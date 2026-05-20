@@ -7,11 +7,17 @@ campaigns, or your own CSV/Markdown file).
 
 ## What it does
 
-- Loads a list of vulnerable npm packages from:
-  - DataDog’s consolidated Shai‑Hulud CSV (by default), and
-  - Tenable’s legacy Markdown list (`list.md`),
-  - optionally a custom URL or local file.
+- Loads a list of vulnerable npm packages from three community trackers by default:
+  - DataDog’s consolidated Shai‑Hulud CSV (`shai-hulud-2.0/consolidated_iocs.csv`),
+  - Tenable’s Markdown list (`list.md`),
+  - Cobenian’s `shai-hulud-detect/compromised-packages.txt` (covers every
+    Shai‑Hulud wave from September 2025 through May 2026; aggregates
+    StepSecurity, Wiz, Semgrep, JFrog, Socket sources).
+  - You can also point at a custom URL or local file.
 - Merges these sources into a single map of vulnerable packages / versions.
+- Recognized list formats (auto-detected by extension): CSV (`.csv`),
+  Markdown table (`.md`), and colon-separated `name:version` (`.txt`,
+  with optional `npm:` / `pypi:` ecosystem prefix).
 - Scans for lockfiles:
   - `yarn.lock` (Yarn v1 / v2+ / Berry)
   - `package-lock.json` (npm v1–v3)

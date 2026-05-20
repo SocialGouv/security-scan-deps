@@ -142,6 +142,23 @@ test("checkYarnLock: missing version results in null version in match", () => {
 });
 
 
+test("checkYarnLock: quoted-key format ('version' '1.2.3')", () => {
+  const content = [
+    '"chalk@^2.0.0":',
+    '  "integrity" "sha512-abc"',
+    '  "resolved" "https://registry.npmjs.org/chalk/-/chalk-2.4.2.tgz"',
+    '  "version" "2.4.2"',
+    "",
+  ].join("\n");
+
+  const compromised = new Set(["chalk@2.4.2"]);
+  const isCompromised = makeMatcher(compromised);
+
+  const result = checkYarnLock(content, isCompromised);
+  assert.deepEqual(result, [{ name: "chalk", version: "2.4.2" }]);
+});
+
+
 test("checkYarnLock: non-compromised returns empty array", () => {
   const content = [
     "foo@^1.0.0:",

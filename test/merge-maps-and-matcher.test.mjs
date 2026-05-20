@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 
 import { _testInternals } from "../index.mjs";
 
-const { mergeCompromisedMaps, buildMatcher } = _testInternals;
+const {
+  mergeCompromisedMaps,
+  buildMatcher,
+  parseCompromisedPackagesFromColonList,
+} = _testInternals;
 
 const makeAllVersionsMap = (entries) => {
   const m = new Map();
@@ -117,6 +121,48 @@ test("buildMatcher: range >=15.0.0 <15.0.5", () => {
   assert.equal(isCompromised("foo", "15.1.0"), false);
 });
 
+
+// --- parseCompromisedPackagesFromColonList ---
+
+test("parseCompromisedPackagesFromColonList: ignores comments and blanks", () => {
+  const text = [
+    "# Header comment",
+    "",
+    "axios:1.14.1",
+    "  ",
+    "# Section break",
+    "@antv/g2:5.5.8",
+  ].join("\n");
+  const map = parseCompromisedPackagesFromColonList(text);
+  assert.equal(map.size, 2);
+  assert([...map.get("axios")].join() === "1.14.1");
+  assert([...map.get("@antv/g2")].join() === "5.5.8");
+});
+
+test("parseCompromisedPackagesFromColonList: strips npm: prefix, skips pypi:", () => {
+  const text = [
+    "npm:lodash:4.17.20",
+    "npm:@scope/pkg:2.0.0",
+    "pypi:requests:2.31.0",
+  ].join("\n");
+  const map = parseCompromisedPackagesFromColonList(text);
+  assert.equal(map.size, 2);
+  assert(map.has("lodash"));
+  assert(map.has("@scope/pkg"));
+  assert(!map.has("requests"));
+});
+
+test("parseCompromisedPackagesFromColonList: dedupes versions for same package", () => {
+  const text = [
+    "size-sensor:1.0.4",
+    "size-sensor:1.1.4",
+    "size-sensor:1.2.4",
+    "size-sensor:1.1.4",
+  ].join("\n");
+  const map = parseCompromisedPackagesFromColonList(text);
+  const versions = [...map.get("size-sensor")].sort();
+  assert.deepEqual(versions, ["1.0.4", "1.1.4", "1.2.4"]);
+});
 
 test("buildMatcher: combination of exact, wildcard and range", () => {
   const map = makeVersionedMap({

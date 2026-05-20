@@ -35,6 +35,12 @@ const DEFAULT_PACKAGE_LIST_URL =
 const TENABLE_MARKDOWN_URL =
   "https://github.com/tenable/shai-hulud-second-coming-affected-packages/raw/main/list.md";
 
+// Community-maintained Cobenian list: name:version per line, includes every
+// Shai-Hulud wave from September 2025 through May 2026 (2700+ versions).
+// Sources cited in-file: StepSecurity, Wiz.io, Semgrep, JFrog, Socket.dev.
+const COBENIAN_PACKAGES_URL =
+  "https://raw.githubusercontent.com/Cobenian/shai-hulud-detect/main/compromised-packages.txt";
+
 /**
  * CLI args parsing.
  *
@@ -498,6 +504,51 @@ function parseCompromisedPackagesFromCsv(text) {
 }
 
 /**
+ * Parse compromised packages from a plain-text "ecosystem-prefixed" list,
+ * one entry per line. Used by community trackers like Cobenian's
+ * shai-hulud-detect/compromised-packages.txt.
+ *
+ * Line format:
+ *   - Lines starting with "#" or blank lines are ignored.
+ *   - Optional ecosystem prefix:
+ *       npm:<name>:<version>        (explicit npm)
+ *       pypi:<name>:<version>       (ignored — this scanner is npm-only)
+ *   - Bare entries default to npm:
+ *       axios:1.14.1
+ *       @antv/g2:5.5.8
+ *
+ * The npm name itself may be scoped (`@scope/name`), which still uses a
+ * single ":" as the version delimiter, so we split at the LAST colon.
+ */
+function parseCompromisedPackagesFromColonList(text) {
+  const compromised = new Map();
+  const lines = text.split(/\r?\n/);
+
+  for (const rawLine of lines) {
+    let line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    const lower = line.toLowerCase();
+    if (lower.startsWith("pypi:")) continue;
+    if (lower.startsWith("npm:")) line = line.slice(4);
+
+    const lastColon = line.lastIndexOf(":");
+    if (lastColon <= 0) continue;
+
+    const name = line.slice(0, lastColon).trim();
+    const version = line.slice(lastColon + 1).trim();
+    if (!name || !version) continue;
+
+    if (!compromised.has(name)) {
+      compromised.set(name, new Set());
+    }
+    compromised.get(name).add(version);
+  }
+
+  return compromised;
+}
+
+/**
  * Merge multiple compromised maps.
  * If any map marks a package as "all versions" (empty Set), the result is all versions.
  */
@@ -550,7 +601,7 @@ function mergeCompromisedMaps(...maps) {
  *   - key    : npm package name (e.g. "@scope/pkg" or "lodash")
  *   - values : set of malicious versions (empty Set => all versions)
  */
-async function loadCompromisedPackagesFromMarkdown(url) {
+async function loadCompromisedPackagesFromUrl(url) {
   // If the URL is a blob URL, convert it to raw
   let fetchUrl = url.replace("/blob/", "/raw/");
 
@@ -564,17 +615,20 @@ async function loadCompromisedPackagesFromMarkdown(url) {
   const text = await res.text();
 
   let compromised;
+  let formatLabel;
   if (/\.csv($|[?#])/i.test(fetchUrl)) {
     compromised = parseCompromisedPackagesFromCsv(text);
-    console.error(
-      `  -> ${compromised.size} compromised packages parsed from CSV.`
-    );
+    formatLabel = "CSV";
+  } else if (/\.txt($|[?#])/i.test(fetchUrl)) {
+    compromised = parseCompromisedPackagesFromColonList(text);
+    formatLabel = "colon-list";
   } else {
     compromised = parseCompromisedPackagesFromMarkdown(text);
-    console.error(
-      `  -> ${compromised.size} compromised packages parsed from markdown.`
-    );
+    formatLabel = "markdown";
   }
+  console.error(
+    `  -> ${compromised.size} compromised packages parsed from ${formatLabel}.`
+  );
 
   if (compromised.size === 0) {
     console.error(
@@ -584,6 +638,9 @@ async function loadCompromisedPackagesFromMarkdown(url) {
 
   return compromised;
 }
+
+// Kept as an alias for backward compatibility with existing imports/tests.
+const loadCompromisedPackagesFromMarkdown = loadCompromisedPackagesFromUrl;
 
 async function loadCompromisedPackages({ packagesUrl, packagesFile }) {
   if (packagesFile) {
@@ -602,17 +659,20 @@ async function loadCompromisedPackages({ packagesUrl, packagesFile }) {
 
     const ext = path.extname(packagesFile).toLowerCase();
     let compromised;
+    let formatLabel;
     if (ext === ".csv") {
       compromised = parseCompromisedPackagesFromCsv(text);
-      console.error(
-        `  -> ${compromised.size} compromised packages parsed from CSV.`
-      );
+      formatLabel = "CSV";
+    } else if (ext === ".txt") {
+      compromised = parseCompromisedPackagesFromColonList(text);
+      formatLabel = "colon-list";
     } else {
       compromised = parseCompromisedPackagesFromMarkdown(text);
-      console.error(
-        `  -> ${compromised.size} compromised packages parsed from markdown.`
-      );
+      formatLabel = "markdown";
     }
+    console.error(
+      `  -> ${compromised.size} compromised packages parsed from ${formatLabel}.`
+    );
 
     if (compromised.size === 0) {
       console.error(
@@ -624,23 +684,35 @@ async function loadCompromisedPackages({ packagesUrl, packagesFile }) {
   }
 
   // No local file: use remote lists.
-  // If the caller did not override the packages URL, aggregate DataDog CSV
-  // and the legacy Tenable markdown list.
+  // If the caller did not override the packages URL, aggregate the three
+  // community trackers (DataDog CSV, Tenable markdown, Cobenian colon-list).
   if (packagesUrl === DEFAULT_PACKAGE_LIST_URL) {
     console.error(
-      "Using aggregated package list: DataDog CSV + Tenable Markdown (list.md)."
+      "Using aggregated package list: DataDog CSV + Tenable Markdown + Cobenian (shai-hulud-detect)."
     );
-    const datadog = await loadCompromisedPackagesFromMarkdown(
-      DEFAULT_PACKAGE_LIST_URL
+    const [datadog, tenable, cobenian] = await Promise.all([
+      loadCompromisedPackagesFromUrl(DEFAULT_PACKAGE_LIST_URL).catch((e) => {
+        console.error(`  ! DataDog source failed: ${e.message}`);
+        return new Map();
+      }),
+      loadCompromisedPackagesFromUrl(TENABLE_MARKDOWN_URL).catch((e) => {
+        console.error(`  ! Tenable source failed: ${e.message}`);
+        return new Map();
+      }),
+      loadCompromisedPackagesFromUrl(COBENIAN_PACKAGES_URL).catch((e) => {
+        console.error(`  ! Cobenian source failed: ${e.message}`);
+        return new Map();
+      }),
+    ]);
+    const merged = mergeCompromisedMaps(datadog, tenable, cobenian);
+    console.error(
+      `  -> ${merged.size} unique compromised packages after merging the three sources.`
     );
-    const tenable = await loadCompromisedPackagesFromMarkdown(
-      TENABLE_MARKDOWN_URL
-    );
-    return mergeCompromisedMaps(datadog, tenable);
+    return merged;
   }
 
   // If the user explicitly provided a URL, keep single-source behavior.
-  return loadCompromisedPackagesFromMarkdown(packagesUrl);
+  return loadCompromisedPackagesFromUrl(packagesUrl);
 }
 
 /**
@@ -869,6 +941,9 @@ export const _testInternals = {
   buildMatcher,
   loadCompromisedPackages,
   parseGitlabLinkHeader,
+  parseCompromisedPackagesFromColonList,
+  parseCompromisedPackagesFromMarkdown,
+  parseCompromisedPackagesFromCsv,
   sha256Short: (text) =>
     "sha256:" +
     crypto.createHash("sha256").update(text).digest("hex").slice(0, 16),
@@ -1432,11 +1507,12 @@ export function checkYarnLock(content, isCompromised) {
         name = name.trim();
         if (name) currentPkgs.push(name);
       }
-    } else if (line.trim().startsWith("version")) {
+    } else if (/^\s*"?version"?\s*[:=\s]/.test(line)) {
       // version "1.2.3" / version: "1.2.3" / version 1.2.3
+      // Also: "version" "1.2.3" (some tooling quotes both keys and values).
       const trimmed = line.trim();
       let version = null;
-      const m = trimmed.match(/^version\s*[:=]?\s*["']?([^"']+)["']?/);
+      const m = trimmed.match(/^"?version"?\s*[:=]?\s*["']?([^"']+)["']?/);
       if (m) {
         version = m[1].trim();
       }
